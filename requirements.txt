@@ -2,3 +2,5 @@ numpy
 pandas
 torch
 tqdm
+torchvision
+torchaudio
