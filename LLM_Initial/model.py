@@ -1,7 +1,7 @@
 import torch
 
 class NeuralCollaborativeFiltering(torch.nn.Module):
-    def __init__(self, user_num, item_num, predictive_factor=32):
+    def __init__(self, user_num, item_num, predictive_factor=32, pretrained_item_embeddings=None):
         super(NeuralCollaborativeFiltering, self).__init__()
         self.mlp_user_embeddings = torch.nn.Embedding(num_embeddings=user_num, embedding_dim=2*predictive_factor)
         self.mlp_item_embeddings = torch.nn.Embedding(num_embeddings=item_num, embedding_dim=2*predictive_factor)
@@ -19,14 +19,18 @@ class NeuralCollaborativeFiltering(torch.nn.Module):
         self.mlp_out = torch.nn.Linear(predictive_factor//2, 1)
         self.output_logits = torch.nn.Linear(predictive_factor, 1)
         self.model_blending = 0.5           # alpha parameter, equation 13 in the paper
-        self.initialize_weights()
+        self.initialize_weights(pretrained_item_embeddings)
         self.join_output_weights()
 
-    def initialize_weights(self):
+    def initialize_weights(self, pretrained_item_embeddings=None):
         torch.nn.init.normal_(self.mlp_user_embeddings.weight, std=0.01)
-        torch.nn.init.normal_(self.mlp_item_embeddings.weight, std=0.01)
         torch.nn.init.normal_(self.gmf_user_embeddings.weight, std=0.01)
-        torch.nn.init.normal_(self.gmf_item_embeddings.weight, std=0.01)
+        if pretrained_item_embeddings is not None:
+            self.mlp_item_embeddings.weight = torch.nn.Parameter(pretrained_item_embeddings.clone())
+            self.gmf_item_embeddings.weight = torch.nn.Parameter(pretrained_item_embeddings.clone())
+        else:
+            torch.nn.init.normal_(self.mlp_item_embeddings.weight, std=0.01)
+            torch.nn.init.normal_(self.gmf_item_embeddings.weight, std=0.01)
         for layer in self.mlp:
             if isinstance(layer, torch.nn.Linear):
                 torch.nn.init.xavier_uniform_(layer.weight)

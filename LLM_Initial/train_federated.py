@@ -5,6 +5,7 @@ import random
 from tqdm import tqdm
 from .server_model import ServerNeuralCollaborativeFiltering
 import copy
+from .llm_item_embeddings import generate_item_embeddings, load_ml1m_item_texts, generate_item_embeddings_for_matrix
 
 class Utils:
 	def __init__(self, num_clients, local_path="./models/local_items/", server_path="./models/central/"):
@@ -47,7 +48,7 @@ def federate(utils):
     utils.save_federated_model(server_model)
 
 class FederatedNCF:
-	def __init__(self, ui_matrix, num_clients=50, user_per_client_range=[1, 1], mode="ncf", aggregation_epochs=50, local_epochs=10, batch_size=128, latent_dim=32, seed=0):
+	def __init__(self, ui_matrix, num_clients=50, user_per_client_range=[1, 1], mode="ncf", aggregation_epochs=50, local_epochs=10, batch_size=128, latent_dim=32, seed=0, use_llm_init=False, item_ids=None):
 		random.seed(seed)
 		self.ui_matrix = ui_matrix
 		self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -58,6 +59,19 @@ class FederatedNCF:
 		self.aggregation_epochs = aggregation_epochs
 		self.local_epochs = local_epochs
 		self.batch_size = batch_size
+		self.pretrained_item_embeddings = None
+		if use_llm_init:
+			item_texts_dict = load_ml1m_item_texts()
+			if item_ids is not None:
+				self.pretrained_item_embeddings = generate_item_embeddings_for_matrix(
+					item_texts_dict, item_ids, target_dim=2*latent_dim
+				)
+			else:
+				# Fallback: assume items are 1..N in order
+				item_ids = list(range(1, ui_matrix.shape[1] + 1))
+				self.pretrained_item_embeddings = generate_item_embeddings_for_matrix(
+					item_texts_dict, item_ids, target_dim=2*latent_dim
+				)
 		self.clients = self.generate_clients()
 		self.ncf_optimizers = [torch.optim.Adam(client.ncf.parameters(), lr=5e-4) for client in self.clients]
 		self.utils = Utils(self.num_clients)
@@ -95,7 +109,11 @@ class FederatedNCF:
 
 	def train(self):
 		first_time = True
-		server_model = ServerNeuralCollaborativeFiltering(item_num=self.ui_matrix.shape[1], predictive_factor=self.latent_dim)
+		server_model = ServerNeuralCollaborativeFiltering(
+			item_num=self.ui_matrix.shape[1], 
+			predictive_factor=self.latent_dim,
+			pretrained_item_embeddings=self.pretrained_item_embeddings
+		)
 		server_model = torch.jit.script(server_model.to(torch.device("cpu")))
 		torch.jit.save(server_model, "./models/central/server"+str(0)+".pt")
 		for epoch in range(self.aggregation_epochs):
@@ -109,5 +127,6 @@ class FederatedNCF:
 
 if __name__ == '__main__':
 	dataloader = MovielensDatasetLoader()
-	fncf = FederatedNCF(dataloader.ratings, num_clients=50, user_per_client_range=[1, 10], mode="ncf", aggregation_epochs=50, local_epochs=10, batch_size=128)
+	fncf = FederatedNCF(dataloader.ratings, num_clients=50, user_per_client_range=[1, 10], 
+		mode="ncf", aggregation_epochs=50, local_epochs=10, batch_size=128, use_llm_init=True)
 	fncf.train()
