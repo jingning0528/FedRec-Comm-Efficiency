@@ -2,7 +2,8 @@ import torch
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-def generate_item_embeddings(item_texts, target_dim, model_name='all-MiniLM-L6-v2', save_path=None):
+def generate_item_embeddings(item_texts, target_dim, model_name='intfloat/e5-base-v2', save_path=None):
+    # Use a smaller model like 'all-MiniLM-L6-v2' for faster embedding generation, or 'intfloat/e5-base-v2' for better quality.
     """
     Generate item embeddings from text descriptions using a pretrained LLM.
     
@@ -31,8 +32,11 @@ def generate_item_embeddings(item_texts, target_dim, model_name='all-MiniLM-L6-v
             padding = np.zeros((raw_embeddings.shape[0], target_dim - llm_dim))
             raw_embeddings = np.concatenate([raw_embeddings, padding], axis=1)
     
-    # Normalize to have similar scale as random init (std≈0.01)
-    raw_embeddings = raw_embeddings / np.std(raw_embeddings) * 0.01
+    # Keep more semantic structure: normalize to unit norm per embedding,
+    # then scale to a moderate std (not 0.01 which is too small)
+    norms = np.linalg.norm(raw_embeddings, axis=1, keepdims=True)
+    norms[norms == 0] = 1
+    raw_embeddings = raw_embeddings / norms * 0.1  # 10x larger than before
     
     embeddings = torch.tensor(raw_embeddings, dtype=torch.float32)
     

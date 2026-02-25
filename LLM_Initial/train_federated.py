@@ -48,7 +48,7 @@ def federate(utils):
     utils.save_federated_model(server_model)
 
 class FederatedNCF:
-	def __init__(self, ui_matrix, num_clients=50, user_per_client_range=[1, 1], mode="ncf", aggregation_epochs=50, local_epochs=10, batch_size=128, latent_dim=32, seed=0, use_llm_init=False, item_ids=None):
+	def __init__(self, ui_matrix, num_clients=50, user_per_client_range=[1, 5], mode="ncf", aggregation_epochs=50, local_epochs=10, batch_size=128, latent_dim=32, seed=0, use_llm_init=False, item_ids=None):
 		random.seed(seed)
 		self.ui_matrix = ui_matrix
 		self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -127,6 +127,6 @@ class FederatedNCF:
 
 if __name__ == '__main__':
 	dataloader = MovielensDatasetLoader()
-	fncf = FederatedNCF(dataloader.ratings, num_clients=50, user_per_client_range=[1, 10], 
+	fncf = FederatedNCF(dataloader.ratings, num_clients=150, user_per_client_range=[1, 1], 
 		mode="ncf", aggregation_epochs=50, local_epochs=10, batch_size=128, use_llm_init=True)
 	fncf.train()
