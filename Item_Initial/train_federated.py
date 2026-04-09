@@ -127,6 +127,6 @@ class FederatedNCF:
 
 if __name__ == '__main__':
 	dataloader = MovielensDatasetLoader()
-	fncf = FederatedNCF(dataloader.ratings, num_clients=150, user_per_client_range=[1, 1], 
-		mode="ncf", aggregation_epochs=50, local_epochs=10, batch_size=128, use_llm_init=True)
+	fncf = FederatedNCF(dataloader.ratings, num_clients=100, user_per_client_range=[1, 1], 
+		mode="ncf", aggregation_epochs=50, local_epochs=5, batch_size=128, use_llm_init=True)
 	fncf.train()
