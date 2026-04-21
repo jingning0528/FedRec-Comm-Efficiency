@@ -1,10 +1,10 @@
 import torch
 from dataloader import MovielensDatasetLoader
-from .model import NeuralCollaborativeFiltering
+from model import NeuralCollaborativeFiltering
+import numpy as np
 from tqdm import tqdm
 from metrics import compute_metrics
 import pandas as pd
-import numpy as np
 
 class MatrixLoader:
 	def __init__(self, ui_matrix, default=None, seed=0):
@@ -114,24 +114,6 @@ class NCFTrainer:
 			return results, progress
 		else:
 			return results
-
-	def evaluate(self):
-		"""Evaluate without training. Returns metrics only."""
-		self.ncf.eval()
-		total_hr, total_ndcg = 0, 0
-		num_users = self.ui_matrix.shape[0]
-		num_items = self.ui_matrix.shape[1]
-		with torch.no_grad():
-			for user_id in range(num_users):
-				item_ids = torch.arange(num_items).int().to(self.device)
-				user_ids = torch.full_like(item_ids, user_id).to(self.device)
-				x = torch.stack([user_ids, item_ids], dim=-1)
-				scores = self.ncf(x).squeeze().cpu().numpy()
-				y = self.ui_matrix[user_id]
-				hr, ndcg = compute_metrics(y, scores)
-				total_hr += hr
-				total_ndcg += ndcg
-		return {"hit_ratio@10": total_hr / num_users, "ndcg@10": total_ndcg / num_users}
 
 if __name__ == '__main__':
 	dataloader = MovielensDatasetLoader()

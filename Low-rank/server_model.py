@@ -30,17 +30,17 @@ class ServerNeuralCollaborativeFiltering(torch.nn.Module):
         torch.nn.init.kaiming_uniform_(self.mlp_out.weight, a=1)
 
     def layer_setter(self, model, model_copy):
-        for m, mc in zip(model.parameters(), model_copy.parameters()):
-            mc.data[:] = m.data[:]
+    	for m, mc in zip(model.parameters(), model_copy.parameters()):
+    		mc.data[:] = m.data[:]
 
     def set_weights(self, model):
-        self.layer_setter(model.mlp_item_embeddings, self.mlp_item_embeddings)
-        self.layer_setter(model.gmf_item_embeddings, self.gmf_item_embeddings)
-        self.layer_setter(model.mlp, self.mlp)
-        self.layer_setter(model.gmf_out, self.gmf_out)
-        self.layer_setter(model.mlp_out, self.mlp_out)
-        self.layer_setter(model.output_logits, self.output_logits)
-
+    	self.layer_setter(model.mlp_item_embeddings, self.mlp_item_embeddings)
+    	self.layer_setter(model.gmf_item_embeddings, self.gmf_item_embeddings)
+    	self.layer_setter(model.mlp, self.mlp)
+    	self.layer_setter(model.gmf_out, self.gmf_out)
+    	self.layer_setter(model.mlp_out, self.mlp_out)
+    	self.layer_setter(model.output_logits, self.output_logits)
+    	
     def forward(self):
         return torch.tensor(0.0)
 
