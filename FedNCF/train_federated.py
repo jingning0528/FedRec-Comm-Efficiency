@@ -1,298 +1,411 @@
 import torch
-from .train_single import NCFTrainer
-from dataloader import MovielensDatasetLoader
+import numpy as np
 import random
-from tqdm import tqdm
-from .server_model import ServerNeuralCollaborativeFiltering
 import copy
 import time
-import numpy as np
 import os
 import sys
 from datetime import datetime
+from tqdm import tqdm
 
-# Bandwidth settings (in Mbps)
+from .train_single import NCFTrainer
+from .server_model import ServerNeuralCollaborativeFiltering
+from dataloader import MovielensDatasetLoader
+
+
+# ── Bandwidth simulation ──────────────────────────────────────────────────────
+
 BANDWIDTH_PROFILES = {
-    "slow":   {"upload": 1,   "download": 2},    # 30% of users
-    "medium": {"upload": 10,  "download": 20},   # 40% of users
-    "fast":   {"upload": 50,  "download": 100},  # 30% of users
+    "slow":   {"upload":  1,  "download":  2},   # 30%
+    "medium": {"upload": 10,  "download": 20},   # 40%
+    "fast":   {"upload": 50,  "download": 100},  # 30%
 }
 
-def assign_bandwidth(num_clients, seed=0):
-    """Assign bandwidth profile to each client: 30% slow, 40% medium, 30% fast."""
+def assign_bandwidth(num_clients: int, seed: int = 0) -> list:
     rng = random.Random(seed)
-    profiles = []
-    for i in range(num_clients):
+    out = []
+    for _ in range(num_clients):
         r = rng.random()
-        if r < 0.3:
-            profiles.append("slow")
-        elif r < 0.7:
-            profiles.append("medium")
-        else:
-            profiles.append("fast")
-    return profiles
+        out.append("slow" if r < 0.3 else ("medium" if r < 0.7 else "fast"))
+    return out
 
-def get_model_size_bits(model):
-    """Calculate model size in bits (float32 = 32 bits per param)."""
-    total_params = sum(p.numel() for p in model.parameters())
-    return total_params * 32  # bits
+def model_size_bits(model: torch.nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters()) * 32
 
-def calc_comm_time(size_bits, bandwidth_mbps):
-    """Calculate communication time in seconds."""
-    bandwidth_bps = bandwidth_mbps * 1e6
-    return size_bits / bandwidth_bps
+def comm_time(size_bits: int, bandwidth_mbps: float) -> float:
+    return size_bits / (bandwidth_mbps * 1e6)
 
-class Utils:
-    def __init__(self, num_clients, local_path="./models/local_items/", server_path="./models/central/"):
-        self.epoch = 0
-        self.num_clients = num_clients
-        self.local_path = local_path
-        self.server_path = server_path
 
-    def load_pytorch_client_model(self, path):
-        return torch.jit.load(path)
+# ── FedAvg aggregation ────────────────────────────────────────────────────────
 
-    def get_user_models(self, loader):
-        models = []
-        for client_id in range(self.num_clients):
-            models.append({'model':loader(self.local_path+"dp"+str(client_id)+".pt")})
-        return models
+class ModelStore:
+    """Thin wrapper around model save/load paths."""
+    def __init__(self, local_items="./models/local_items/",
+                 local="./models/local/",
+                 central="./models/central/"):
+        self.local_items = local_items
+        self.local       = local
+        self.central     = central
+        for p in [local_items, local, central]:
+            os.makedirs(p, exist_ok=True)
 
-    def get_previous_federated_model(self):
-        self.epoch += 1
-        return torch.jit.load(self.server_path+"server"+str(self.epoch-1)+".pt")
+    def save_client(self, model, client_id):
+        torch.jit.save(torch.jit.script(model.cpu()), f"{self.local}dp{client_id}.pt")
 
-    def save_federated_model(self, model):
-        torch.jit.save(model, self.server_path+"server"+str(self.epoch)+".pt")
+    def save_item_model(self, item_model, client_id):
+        torch.jit.save(torch.jit.script(item_model.cpu()),
+                       f"{self.local_items}dp{client_id}.pt")
 
-def federate(utils):
-    client_models = utils.get_user_models(utils.load_pytorch_client_model)
-    server_model = utils.get_previous_federated_model()
-    if len(client_models) == 0:
-        utils.save_federated_model(server_model)
-        return 0.0
-    
-    agg_start = time.time()
-    n = len(client_models)
-    server_new_dict = copy.deepcopy(client_models[0]['model'].state_dict())
-    for i in range(1, len(client_models)):
-        client_dict = client_models[i]['model'].state_dict()
-        for k in client_dict.keys():
-            server_new_dict[k] += client_dict[k] 
-    for k in server_new_dict.keys():
-        server_new_dict[k] = server_new_dict[k] / n
-    server_model.load_state_dict(server_new_dict)
-    utils.save_federated_model(server_model)
-    agg_time = time.time() - agg_start
-    return agg_time
+    def load_item_model(self, client_id):
+        return torch.jit.load(f"{self.local_items}dp{client_id}.pt")
+
+    def save_server(self, model, epoch):
+        torch.jit.save(torch.jit.script(model.cpu()), f"{self.central}server{epoch}.pt")
+
+    def load_server(self, epoch, device):
+        return torch.jit.load(f"{self.central}server{epoch}.pt", map_location=device)
+
+
+def fedavg(store: ModelStore, num_clients: int, server_model, epoch: int) -> float:
+    """FedAvg: average item-model weights from all clients, save as new server."""
+    t0 = time.time()
+    client_models = [store.load_item_model(i) for i in range(num_clients)]
+
+    avg_dict = copy.deepcopy(client_models[0].state_dict())
+    for cm in client_models[1:]:
+        for k, v in cm.state_dict().items():
+            avg_dict[k] += v
+    for k in avg_dict:
+        avg_dict[k] = avg_dict[k] / num_clients
+
+    server_model.load_state_dict(avg_dict)
+    store.save_server(server_model, epoch + 1)
+    return time.time() - t0
+
+
+# ── Logger ────────────────────────────────────────────────────────────────────
 
 class TeeLogger:
-    """Writes output to both stdout and a log file simultaneously."""
-    def __init__(self, log_path):
-        self.terminal = sys.stdout
+    def __init__(self, log_path: str):
+        self._terminal = sys.stdout
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
-        self.log_file = open(log_path, 'w', buffering=1)
+        self._file = open(log_path, 'w', buffering=1)
 
-    def write(self, message):
-        self.terminal.write(message)
-        self.log_file.write(message)
+    def write(self, msg):
+        self._terminal.write(msg)
+        self._file.write(msg)
 
     def flush(self):
-        self.terminal.flush()
-        self.log_file.flush()
+        self._terminal.flush()
+        self._file.flush()
 
     def close(self):
-        self.log_file.close()
-        sys.stdout = self.terminal
+        self._file.close()
+        sys.stdout = self._terminal
+
+
+# ── Federated NCF ─────────────────────────────────────────────────────────────
 
 class FederatedNCF:
-    def __init__(self, ui_matrix, num_clients=50, user_per_client_range=[1, 5], mode="ncf",
-                 aggregation_epochs=50, local_epochs=10, batch_size=128, latent_dim=32, seed=0):
+    def __init__(self,
+                 train_matrix:  np.ndarray,
+                 num_clients:   int   = 604,
+                 aggregation_epochs: int = 50,
+                 local_epochs:  int   = 5,
+                 batch_size:    int   = 128,
+                 latent_dim:    int   = 32,
+                 lr:            float = 1e-3,
+                 seed:          int   = 0,
+                 device:        str   = None):   # ← NEW
+
         random.seed(seed)
-        self.ui_matrix = ui_matrix
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        self.num_clients = num_clients
-        self.latent_dim = latent_dim
-        self.user_per_client_range = user_per_client_range
-        self.mode = mode
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+
+        # Use passed device, or auto-detect
+        if device is not None:
+            self.device = torch.device(device)
+        else:
+            self.device = torch.device(
+                "cuda" if torch.cuda.is_available() else
+                "mps"  if torch.backends.mps.is_available() else
+                "cpu"
+            )
+
+        self.num_clients        = num_clients
         self.aggregation_epochs = aggregation_epochs
-        self.local_epochs = local_epochs
-        self.batch_size = batch_size
-        self.clients = self.generate_clients()
-        self.ncf_optimizers = [torch.optim.Adam(client.ncf.parameters(), lr=5e-4) for client in self.clients]
-        self.utils = Utils(self.num_clients)
+        self.local_epochs       = local_epochs
+        self.batch_size         = batch_size
+        self.latent_dim         = latent_dim
+        self.lr                 = lr
+        self.item_num           = train_matrix.shape[1]
+
+        self.store              = ModelStore()
         self.bandwidth_profiles = assign_bandwidth(num_clients, seed=seed)
-        self.timing_log = []  # stores per-epoch timing summary
-        self.metrics_log = []
+        self.metrics_log        = []
+        self.eval_log           = []
+        self.timing_log         = []
 
-        # Root of project = parent of this file's folder
-        # __file__ = .../FedRec_Comm_Efficiency/FedNCF/train_federated.py
-        # root     = .../FedRec_Comm_Efficiency/
-        root         = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        folder_name  = os.path.basename(os.path.dirname(os.path.abspath(__file__)))
-        timestamp    = datetime.now().strftime("%Y%m%d-%H%M%S")
-        log_dir      = os.path.join(root, "result_figure")
-        self.log_path = os.path.join(log_dir, f"{folder_name}-{timestamp}.txt")
+        # ── One client per user — leave-one-out split happens inside NCFTrainer ──
+        # train_matrix[i] → NCFTrainer splits it into:
+        #   - train interactions (all except held-out item)  → used for local SGD
+        #   - test item (held-out)                           → used for evaluate_standard()
+        assert train_matrix.shape[0] == num_clients, \
+            f"num_clients={num_clients} must equal train_matrix rows={train_matrix.shape[0]}"
 
-        self.logger  = TeeLogger(self.log_path)
-        sys.stdout   = self.logger
+        self.clients = [
+            NCFTrainer(train_matrix[i:i+1], epochs=local_epochs,
+                       batch_size=batch_size, latent_dim=latent_dim,
+                       device=self.device, global_user_offset=i)
+            for i in range(num_clients)
+        ]
+        self.optimizers = [
+            torch.optim.Adam(c.ncf.parameters(), lr=lr) for c in self.clients
+        ]
+
+        # ── Logging ───────────────────────────────────────────────────────────
+        root      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        log_dir   = os.path.join(root, "result_figure")
+        folder    = os.path.basename(os.path.dirname(os.path.abspath(__file__)))
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        self.log_path = os.path.join(log_dir, f"{folder}-{timestamp}.txt")
+        self.logger   = TeeLogger(self.log_path)
+        sys.stdout    = self.logger
+
         print(f"Log file : {self.log_path}")
         print(f"Started  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Device   : {self.device}")
+        print(f"{'='*60}")
+        print(f"Dataset       : ML-1M  |  Items: {self.item_num}")
+        print(f"Users         : {num_clients}  (same users train & test, leave-one-out split)")
+        print(f"Local epochs  : {local_epochs}")
+        print(f"Batch size    : {batch_size}")
+        print(f"Latent dim    : {latent_dim}")
+        print(f"Learning rate : {lr}")
+        print(f"Bandwidth     : "
+              f"{self.bandwidth_profiles.count('slow')} slow, "
+              f"{self.bandwidth_profiles.count('medium')} medium, "
+              f"{self.bandwidth_profiles.count('fast')} fast")
         print(f"{'='*60}")
 
-    def generate_clients(self):
-        start_index = 0
-        clients = []
-        for i in range(self.num_clients):
-            users = random.randint(self.user_per_client_range[0], self.user_per_client_range[1])
-            clients.append(NCFTrainer(self.ui_matrix[start_index:start_index+users], epochs=self.local_epochs, batch_size=self.batch_size))
-            start_index += users
-        return clients
+    # ── Single training round ─────────────────────────────────────────────────
 
-    def single_round(self, epoch=0, first_time=False, server_model_size_bits=0, item_model_size_bits=0):
-        single_round_results = {key:[] for key in ["num_users", "loss", "hit_ratio@10", "ndcg@10"]}
-        client_timings = []
+    def _single_round(self, epoch: int, server_bits: int, item_bits: int) -> list:
+        timings     = []
+        agg_results = {"loss": [], "hit_ratio@10": [], "ndcg@10": []}
 
-        bar = tqdm(enumerate(self.clients), total=self.num_clients)
-        for client_id, client in bar:
-            profile_name = self.bandwidth_profiles[client_id]
-            bw = BANDWIDTH_PROFILES[profile_name]
+        bar = tqdm(enumerate(self.clients), total=self.num_clients,
+                   desc=f"Epoch {epoch}")
+        for cid, client in bar:
+            bw         = BANDWIDTH_PROFILES[self.bandwidth_profiles[cid]]
+            dl_time    = comm_time(server_bits, bw["download"])
+            t0         = time.time()
+            results    = client.train(self.optimizers[cid])
+            train_time = time.time() - t0
+            ul_time    = comm_time(item_bits, bw["upload"])
 
-            # --- Download time: server model sent to client ---
-            download_time = calc_comm_time(server_model_size_bits, bw["download"])
-
-            # --- Local training time ---
-            train_start = time.time()
-            results = client.train(self.ncf_optimizers[client_id])
-            train_time = time.time() - train_start
-
-            # --- Upload time: item model sent to server ---
-            upload_time = calc_comm_time(item_model_size_bits, bw["upload"])
-
-            client_timings.append({
-                "client_id": client_id,
-                "bandwidth": profile_name,
-                "download_time_s": round(download_time, 4),
-                "train_time_s": round(train_time, 4),
-                "upload_time_s": round(upload_time, 4),
-                "total_time_s": round(download_time + train_time + upload_time, 4),
+            timings.append({
+                "client_id":       cid,
+                "bandwidth":       self.bandwidth_profiles[cid],
+                "download_time_s": round(dl_time,    4),
+                "train_time_s":    round(train_time, 4),
+                "upload_time_s":   round(ul_time,    4),
+                "total_time_s":    round(dl_time + train_time + ul_time, 4),
             })
+            for key in ["loss", "hit_ratio@10", "ndcg@10"]:
+                agg_results[key].append(results[key])
 
-            for k,i in results.items():
-                single_round_results[k].append(i)
-            printing_single_round = {"epoch": epoch}
-            printing_single_round.update({k:round(sum(i)/len(i), 4) for k,i in single_round_results.items()})
-            model = torch.jit.script(client.ncf.to(torch.device("cpu")))
-            torch.jit.save(model, "./models/local/dp"+str(client_id)+".pt")
-            bar.set_description(str(printing_single_round))
+            self.store.save_client(client.ncf, cid)
+            bar.set_postfix({"loss": f"{results['loss']:.4f}",
+                             "HR@10": f"{results['hit_ratio@10']:.4f}"})
         bar.close()
 
-        # ── Save metrics for this round ──
         self.metrics_log.append({
             "epoch":        epoch,
-            "loss":         round(float(np.mean(single_round_results["loss"])),         6),
-            "hit_ratio@10": round(float(np.mean(single_round_results["hit_ratio@10"])), 6),
-            "ndcg@10":      round(float(np.mean(single_round_results["ndcg@10"])),      6),
+            "loss":         round(float(np.mean(agg_results["loss"])),         6),
+            "hit_ratio@10": round(float(np.mean(agg_results["hit_ratio@10"])), 6),
+            "ndcg@10":      round(float(np.mean(agg_results["ndcg@10"])),      6),
         })
+        return timings
 
-        return client_timings
+    # ── Extract item-only models for aggregation ──────────────────────────────
 
-    def extract_item_models(self):
-        for client_id in range(self.num_clients):
-            model = torch.jit.load("./models/local/dp"+str(client_id)+".pt")
-            item_model = ServerNeuralCollaborativeFiltering(item_num=self.ui_matrix.shape[1], predictive_factor=self.latent_dim)
-            item_model.set_weights(model)
-            item_model = torch.jit.script(item_model.to(torch.device("cpu")))
-            torch.jit.save(item_model, "./models/local_items/dp"+str(client_id)+".pt")
+    def _extract_item_models(self):
+        for cid in range(self.num_clients):
+            full_model = torch.jit.load(f"./models/local/dp{cid}.pt")
+            item_model = ServerNeuralCollaborativeFiltering(
+                item_num=self.item_num, predictive_factor=self.latent_dim)
+            item_model.set_weights(full_model)
+            self.store.save_item_model(item_model, cid)
 
-    def print_timing_summary(self, epoch, client_timings, agg_time):
-        by_profile = {"slow": [], "medium": [], "fast": []}
-        for ct in client_timings:
-            by_profile[ct["bandwidth"]].append(ct)
+    # ── Standard evaluation ───────────────────────────────────────────────────
+
+    def _evaluate(self, epoch: int, k: int = 10, n_neg: int = 99):
+        """
+        Evaluate every training client using their held-out test item.
+        Each client's model already has up-to-date weights from local training.
+        No fine-tuning needed — user embeddings were trained during local SGD.
+        """
+        hrs, ndcgs, losses = [], [], []
+        for client in self.clients:
+            res = client.evaluate_standard(n_neg=n_neg, k=k)
+            n   = res["evaluated_users"]
+            if n > 0:
+                hrs.extend(   [res[f"hr@{k}"]]   * n)
+                ndcgs.extend( [res[f"ndcg@{k}"]] * n)
+                losses.extend([res["eval_loss"]]  * n)
+
+        hr_mean   = float(np.mean(hrs))    if hrs    else 0.0
+        ndcg_mean = float(np.mean(ndcgs))  if ndcgs  else 0.0
+        loss_mean = float(np.mean(losses)) if losses else 0.0
+        total_n   = len(hrs)
+
+        record = {
+            "epoch":           epoch,
+            f"hr@{k}":         round(hr_mean,   6),
+            f"ndcg@{k}":       round(ndcg_mean, 6),
+            "eval_loss":       round(loss_mean, 6),
+            "evaluated_users": total_n,
+        }
+        self.eval_log.append(record)
+
+        print(f"\n[Standard Eval — Epoch {epoch:>3d}]  "
+              f"HR@{k} = {hr_mean:.4f}  |  NDCG@{k} = {ndcg_mean:.4f}  |  "
+              f"Eval Loss = {loss_mean:.4f}  ({total_n} users)\n")
+        return record
+
+    # ── Timing summary ────────────────────────────────────────────────────────
+
+    def _print_timing(self, epoch: int, timings: list, agg_time: float):
+        by_bw = {"slow": [], "medium": [], "fast": []}
+        for t in timings:
+            by_bw[t["bandwidth"]].append(t)
 
         print(f"\n{'='*60}")
         print(f"Epoch {epoch} Timing Summary")
         print(f"{'='*60}")
-        for profile, timings in by_profile.items():
-            if not timings:
+        for name, ts in by_bw.items():
+            if not ts:
                 continue
-            avg_dl  = np.mean([t["download_time_s"] for t in timings])
-            avg_tr  = np.mean([t["train_time_s"] for t in timings])
-            avg_ul  = np.mean([t["upload_time_s"] for t in timings])
-            avg_tot = np.mean([t["total_time_s"] for t in timings])
-            print(f"  [{profile.upper():6s}] n={len(timings):2d} | "
-                  f"download={avg_dl:.4f}s | train={avg_tr:.4f}s | "
-                  f"upload={avg_ul:.4f}s | total={avg_tot:.4f}s")
+            print(f"  [{name.upper():6s}] n={len(ts):3d} | "
+                  f"download={np.mean([t['download_time_s'] for t in ts]):.4f}s | "
+                  f"train={np.mean([t['train_time_s'] for t in ts]):.4f}s | "
+                  f"upload={np.mean([t['upload_time_s'] for t in ts]):.4f}s | "
+                  f"total={np.mean([t['total_time_s'] for t in ts]):.4f}s")
+        bottleneck = max(t["total_time_s"] for t in timings)
+        print(f"  [ROUND ] bottleneck = {bottleneck:.4f}s")
+        print(f"  [AGG   ] agg time   = {agg_time:.4f}s")
+        print(f"  [TOTAL ] round time = {bottleneck + agg_time:.4f}s")
+        print(f"{'='*60}")
 
-        all_totals = [t["total_time_s"] for t in client_timings]
-        print(f"  [ROUND ] bottleneck (max client time) = {max(all_totals):.4f}s")
-        print(f"  [AGG   ] aggregation time             = {agg_time:.4f}s")
-        print(f"  [TOTAL ] round time (bottleneck+agg)  = {max(all_totals)+agg_time:.4f}s")
-        print(f"{'='*60}\n")
+    # ── Main training loop ────────────────────────────────────────────────────
 
     def train(self):
-        first_time = True
-        server_model = ServerNeuralCollaborativeFiltering(item_num=self.ui_matrix.shape[1], predictive_factor=self.latent_dim)
-        server_model = torch.jit.script(server_model.to(torch.device("cpu")))
-        torch.jit.save(server_model, "./models/central/server"+str(0)+".pt")
+        server_model = ServerNeuralCollaborativeFiltering(
+            item_num=self.item_num, predictive_factor=self.latent_dim)
+        self.store.save_server(server_model, 0)
 
-        # Pre-calculate model sizes
-        server_model_size_bits = get_model_size_bits(server_model)
-        item_model_size_bits = server_model_size_bits  # same architecture
-
-        print(f"Server model size: {server_model_size_bits/8/1024:.2f} KB")
-        print(f"Item model size:   {item_model_size_bits/8/1024:.2f} KB")
-        print(f"Bandwidth distribution: "
-              f"{self.bandwidth_profiles.count('slow')} slow, "
-              f"{self.bandwidth_profiles.count('medium')} medium, "
-              f"{self.bandwidth_profiles.count('fast')} fast")
+        server_bits = model_size_bits(server_model)
+        item_bits   = server_bits
+        print(f"Server model size : {server_bits / 8 / 1024:.2f} KB")
 
         for epoch in range(self.aggregation_epochs):
-            server_model = torch.jit.load("./models/central/server"+str(epoch)+".pt", map_location=self.device)
-            _ = [client.ncf.to(self.device) for client in self.clients]
-            _ = [client.ncf.load_server_weights(server_model) for client in self.clients]
+            # 1. Distribute server item weights to all clients
+            sv = self.store.load_server(epoch, self.device)
+            for client in self.clients:
+                client.ncf.load_server_weights(sv)
 
-            client_timings = self.single_round(
-                epoch=epoch, first_time=first_time,
-                server_model_size_bits=server_model_size_bits,
-                item_model_size_bits=item_model_size_bits
-            )
-            first_time = False
-            self.extract_item_models()
-            agg_time = federate(self.utils)
-            self.print_timing_summary(epoch, client_timings, agg_time)
-            self.timing_log.append({"epoch": epoch, "client_timings": client_timings, "agg_time": agg_time})
+            # 2. Local training (trains BOTH user embeddings AND item embeddings)
+            timings  = self._single_round(epoch, server_bits, item_bits)
 
-        self._save_final_summary()
+            # 3. Extract item-only models & FedAvg (user embeddings stay local)
+            self._extract_item_models()
+            agg_time = fedavg(self.store, self.num_clients, server_model, epoch)
+
+            # 4. Print timing
+            self._print_timing(epoch, timings, agg_time)
+            self.timing_log.append({"epoch": epoch,
+                                    "timings": timings, "agg_time": agg_time})
+
+            # 5. Standard evaluation on held-out test items
+            self._evaluate(epoch, k=10, n_neg=99)
+
+        self._final_summary()
         self.logger.close()
 
-    def _save_final_summary(self):
+    # ── Final summary ─────────────────────────────────────────────────────────
+
+    def _final_summary(self):
         print(f"\n{'='*60}")
         print(f"TRAINING COMPLETE — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'='*60}")
-        print(f"{'Epoch':>6} | {'Loss':>8} | {'HR@10':>8} | {'NDCG@10':>8}")
-        print(f"{'-'*42}")
+
+        print(f"\n-- Training metrics (batch-level, reference only) --")
+        print(f"{'Epoch':>6} | {'Loss':>8} | {'HR@10(train)':>12} | {'NDCG@10(train)':>14}")
+        print("-" * 48)
         for m in self.metrics_log:
-            print(f"{m['epoch']:>6} | {m['loss']:>8.4f} | {m['hit_ratio@10']:>8.4f} | {m['ndcg@10']:>8.4f}")
-        print(f"{'='*60}")
+            print(f"{m['epoch']:>6} | {m['loss']:>8.4f} | "
+                  f"{m['hit_ratio@10']:>12.4f} | {m['ndcg@10']:>14.4f}")
+
+        if self.eval_log:
+            print(f"\n-- Standard leave-one-out evaluation (1 pos + 99 neg, paper-standard) --")
+            print(f"{'Epoch':>6} | {'HR@10':>8} | {'NDCG@10':>10} | {'EvalLoss':>10} | {'Users':>7}")
+            print("-" * 52)
+            for e in self.eval_log:
+                print(f"{e['epoch']:>6} | {e['hr@10']:>8.4f} | "
+                      f"{e['ndcg@10']:>10.4f} | {e['eval_loss']:>10.4f} | "
+                      f"{e['evaluated_users']:>7}")
+            best_hr   = max(self.eval_log, key=lambda x: x["hr@10"])
+            best_ndcg = max(self.eval_log, key=lambda x: x["ndcg@10"])
+            last      = self.eval_log[-1]
+            print(f"\nBest  HR@10   : {best_hr['hr@10']:.6f}  (epoch {best_hr['epoch']})")
+            print(f"Best  NDCG@10 : {best_ndcg['ndcg@10']:.6f}  (epoch {best_ndcg['epoch']})")
+            print(f"Final HR@10   : {last['hr@10']:.6f}")
+            print(f"Final NDCG@10 : {last['ndcg@10']:.6f}")
+
         if self.timing_log:
-            all_totals  = [max(t["total_time_s"] for t in tl["client_timings"])
+            rounds      = [max(t["total_time_s"] for t in tl["timings"])
                            for tl in self.timing_log]
-            total_round = sum(all_totals)
+            total_round = sum(rounds)
             total_agg   = sum(t["agg_time"] for t in self.timing_log)
             print(f"\nTotal rounds     : {len(self.timing_log)}")
-            print(f"Total round time : {total_round:.2f}s ({total_round/60:.2f} min)")
-            print(f"Total agg time   : {total_agg:.2f}s")
+            print(f"Total round time : {total_round:.2f}s  ({total_round/60:.2f} min)")
             print(f"Avg time / round : {total_round/len(self.timing_log):.4f}s")
-        if self.metrics_log:
-            last = self.metrics_log[-1]
-            print(f"\nFinal metrics:")
-            print(f"  Loss    : {last['loss']}")
-            print(f"  HR@10   : {last['hit_ratio@10']}")
-            print(f"  NDCG@10 : {last['ndcg@10']}")
-        print(f"\nLog saved → {self.log_path}")
+            print(f"Total agg time   : {total_agg:.2f}s")
 
-if __name__ == '__main__':
-    dataloader = MovielensDatasetLoader()
-    fncf = FederatedNCF(dataloader.ratings, num_clients=60, user_per_client_range=[1, 1], mode="ncf", aggregation_epochs=50, local_epochs=5, batch_size=128)
+        print(f"\nLog saved → {self.log_path}")
+        print(f"{'='*60}")
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    # ── Device: auto-detects GPU, falls back to CPU ───────────────────────────
+    # Colab (NVIDIA): "cuda"
+    # MacBook (Apple Silicon): "mps"
+    # MacBook (CPU):  "cpu"
+    DEVICE = (
+        "cuda" if torch.cuda.is_available() else
+        "mps"  if torch.backends.mps.is_available() else
+        "cpu"
+    )
+    print(f"Using device: {DEVICE}")
+
+    dataloader   = MovielensDatasetLoader()
+    all_ratings  = dataloader.ratings          # (6040, 3706)
+
+    n_clients    = 604
+    train_matrix = all_ratings[:n_clients]
+
+    fncf = FederatedNCF(
+        train_matrix       = train_matrix,
+        num_clients        = n_clients,
+        aggregation_epochs = 50,
+        local_epochs       = 2,
+        batch_size         = 256,
+        latent_dim         = 64,
+        lr                 = 5e-4,
+        seed               = 42,
+        device             = DEVICE,           # ← pass device explicitly
+    )
     fncf.train()

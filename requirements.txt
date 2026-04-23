@@ -2,7 +2,5 @@ numpy
 pandas
 torch
 tqdm
-torchvision
-torchaudio
-sentence-transformers 
+matplotlib
 scikit-learn
