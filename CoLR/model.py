@@ -73,27 +73,27 @@ class NeuralCollaborativeFiltering(torch.nn.Module):
              (1 - self.model_blending) * self.mlp_out.weight), dim=1))
         self.output_logits.weight = W
 
-    def load_server_weights(self, server_model):
+    def load_server_weights(self, server_model, prev_A_mlp=None, prev_A_gmf=None):
         """
         Called at start of each round.
-        Copies updated item base + shared B from server; resets A to zero;
-        freezes item embeddings so only A_n (and user_emb) are trained.
+        Copies updated item base + shared B from server.
+        Warm-starts A from previous round instead of zeroing (faster convergence).
         """
-        # Updated item embedding base (I already incorporates previous round's B@A)
         self.mlp_item_embeddings.weight.data.copy_(server_model.mlp_item_embeddings.weight.data)
         self.gmf_item_embeddings.weight.data.copy_(server_model.gmf_item_embeddings.weight.data)
-        # Shared B from server
         self.B_mlp.copy_(server_model.B_mlp)
         self.B_gmf.copy_(server_model.B_gmf)
-        # Shared MLP weights
         self.mlp.load_state_dict(server_model.mlp.state_dict())
         self.gmf_out.load_state_dict(server_model.gmf_out.state_dict())
         self.mlp_out.load_state_dict(server_model.mlp_out.state_dict())
         self.output_logits.load_state_dict(server_model.output_logits.state_dict())
-        # Reset A to zero for this round
-        self.A_mlp.data.zero_()
-        self.A_gmf.data.zero_()
-        # Freeze item base and B (buffers are already non-param; freeze embedding weights)
+        # Warm-start A from previous round; zero only on first round
+        if prev_A_mlp is not None:
+            self.A_mlp.data.copy_(prev_A_mlp)
+            self.A_gmf.data.copy_(prev_A_gmf)
+        else:
+            self.A_mlp.data.zero_()
+            self.A_gmf.data.zero_()
         self.mlp_item_embeddings.weight.requires_grad_(False)
         self.gmf_item_embeddings.weight.requires_grad_(False)
 

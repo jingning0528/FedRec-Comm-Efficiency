@@ -10,10 +10,14 @@ class ServerNeuralCollaborativeFiltering(torch.nn.Module):
         self.mlp_item_embeddings = torch.nn.Embedding(num_embeddings=item_num, embedding_dim=embed_dim)
         self.gmf_item_embeddings = torch.nn.Embedding(num_embeddings=item_num, embedding_dim=embed_dim)
 
-        # ── Shared B matrices — fixed random projection, sent to all clients ──
-        # Generated once; same B used across a round so A_n can be averaged.
-        self.register_buffer('B_mlp', torch.randn(item_num, rank) * 0.01)
-        self.register_buffer('B_gmf', torch.randn(item_num, rank) * 0.01)
+        # ── Shared B matrices ──
+        # Orthogonal init: columns are orthonormal → unit-scale gradient signal to A
+        B_mlp_init = torch.zeros(item_num, rank)
+        B_gmf_init = torch.zeros(item_num, rank)
+        torch.nn.init.orthogonal_(B_mlp_init[:rank] if item_num >= rank else B_mlp_init)
+        torch.nn.init.orthogonal_(B_gmf_init[:rank] if item_num >= rank else B_gmf_init)
+        self.register_buffer('B_mlp', B_mlp_init)
+        self.register_buffer('B_gmf', B_gmf_init)
 
         self.mlp = torch.nn.Sequential(
             torch.nn.Linear(4 * predictive_factor, 2 * predictive_factor),

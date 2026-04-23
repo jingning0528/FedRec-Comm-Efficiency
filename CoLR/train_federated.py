@@ -254,6 +254,9 @@ class FederatedNCF:
         print(f"[CoLR] Upload reduction: {reduction_pct:.1f}%")
         print(f"{'='*60}")
 
+        # Store previous-round A matrices per client for warm-starting
+        self._prev_A = {cid: None for cid in range(num_clients)}   # ← add
+
     # ── Single training round ─────────────────────────────────────────────────
 
     def _single_round(self, epoch: int, server_bits: int, upload_bits: int) -> list:
@@ -368,30 +371,40 @@ class FederatedNCF:
         print(f"Client upload size   : {upload_bits / 8 / 1024:.2f} KB  (CoLR A only)")
 
         for epoch in range(self.aggregation_epochs):
-            # 1. Distribute server weights (updated I, shared B) to all clients
             sv = self.store.load_server(epoch, self.device)
-            for client in self.clients:
+            for cid, client in enumerate(self.clients):
                 client.ncf.to(self.device)
-                client.ncf.load_server_weights(sv)   # copies I, B, MLP; resets A; freezes I
-                # Rebuild optimizer to only include trainable params (A + user_emb)
+                prev = self._prev_A[cid]
+                # Pass previous A for warm-start; None on first round
+                client.ncf.load_server_weights(
+                    sv,
+                    prev_A_mlp=prev["A_mlp"].to(self.device) if prev else None,
+                    prev_A_gmf=prev["A_gmf"].to(self.device) if prev else None,
+                )
+
+            # Separate, higher LR for A matrices vs MLP
             self.optimizers = [
-                torch.optim.Adam(
-                    filter(lambda p: p.requires_grad, c.ncf.parameters()), lr=self.lr
-                ) for c in self.clients
+                torch.optim.Adam([
+                    {"params": [p for n, p in c.ncf.named_parameters()
+                                if p.requires_grad and ("A_mlp" in n or "A_gmf" in n)],
+                     "lr": self.lr * 10},                      # ← 10× LR for A
+                    {"params": [p for n, p in c.ncf.named_parameters()
+                                if p.requires_grad and "A_mlp" not in n and "A_gmf" not in n],
+                     "lr": self.lr},
+                ]) for c in self.clients
             ]
 
-            # 2. Local training — each client trains A_n (+ user_emb), uploads A_n
             timings  = self._single_round(epoch, server_bits, upload_bits)
 
-            # 3. CoLR aggregation: average A_n, update I = I + B @ A_avg
+            # Cache A matrices before aggregation for next-round warm-start
+            for cid in range(self.num_clients):
+                d = self.store.load_A(cid)
+                self._prev_A[cid] = {"A_mlp": d["A_mlp"], "A_gmf": d["A_gmf"]}   # ← add
+
             agg_time = colr_aggregate(self.store, self.num_clients, server_model, epoch)
-
-            # 4. Print timing
             self._print_timing(epoch, timings, agg_time)
-            self.timing_log.append({"epoch": epoch,
-                                    "timings": timings, "agg_time": agg_time})
+            self.timing_log.append({"epoch": epoch, "timings": timings, "agg_time": agg_time})
 
-            # 5. Evaluate
             if (epoch + 1) % self.eval_every == 0 or epoch == self.aggregation_epochs - 1:
                 self._evaluate(epoch, k=10, n_neg=99)
 
