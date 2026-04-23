@@ -16,16 +16,10 @@ from dataloader import MovielensDatasetLoader
 # ── Bandwidth simulation ──────────────────────────────────────────────────────
 
 BANDWIDTH_PROFILES = {
-    "slow":   {"upload": 100,  "download": 100},   # 30%
-    "medium": {"upload": 100,  "download": 100},   # 40%
-    "fast":   {"upload": 100,  "download": 100},  # 30%
+    "slow":   {"upload": 100,  "download": 100},
+    "medium": {"upload": 100,  "download": 100},
+    "fast":   {"upload": 100,  "download": 100},
 }
-
-# BANDWIDTH_PROFILES = {
-#     "slow":   {"upload":  1,  "download":  2},   # 30%
-#     "medium": {"upload": 10,  "download": 20},   # 40%
-#     "fast":   {"upload": 50,  "download": 100},  # 30%
-# }
 
 def assign_bandwidth(num_clients: int, seed: int = 0) -> list:
     rng = random.Random(seed)
@@ -41,11 +35,14 @@ def model_size_bits(model: torch.nn.Module) -> int:
 def comm_time(size_bits: int, bandwidth_mbps: float) -> float:
     return size_bits / (bandwidth_mbps * 1e6)
 
+def a_matrix_size_bits(rank: int, embed_dim: int) -> int:
+    """Bits for two A matrices (mlp + gmf): rank × embed_dim × 2 × 32."""
+    return rank * embed_dim * 2 * 32
 
-# ── FedAvg aggregation ────────────────────────────────────────────────────────
+
+# ── CoLR aggregation ──────────────────────────────────────────────────────────
 
 class ModelStore:
-    """Thin wrapper around model save/load paths."""
     def __init__(self, local_items="./models/local_items/",
                  local="./models/local/",
                  central="./models/central/"):
@@ -56,35 +53,62 @@ class ModelStore:
             os.makedirs(p, exist_ok=True)
 
     def save_client(self, model, client_id):
-        torch.jit.save(torch.jit.script(model.cpu()), f"{self.local}dp{client_id}.pt")
+        torch.save(model.cpu().state_dict(), f"{self.local}dp{client_id}.pt")
 
-    def save_item_model(self, item_model, client_id):
-        torch.jit.save(torch.jit.script(item_model.cpu()),
-                       f"{self.local_items}dp{client_id}.pt")
+    def load_client_state(self, client_id):
+        return torch.load(f"{self.local}dp{client_id}.pt", map_location="cpu")
 
-    def load_item_model(self, client_id):
-        return torch.jit.load(f"{self.local_items}dp{client_id}.pt")
+    def save_A(self, client_id: int, A_mlp: torch.Tensor, A_gmf: torch.Tensor):
+        """Save only the low-rank A matrices for a client (CoLR upload payload)."""
+        torch.save({"A_mlp": A_mlp.detach().cpu(),
+                    "A_gmf": A_gmf.detach().cpu()},
+                   f"{self.local_items}dp{client_id}_A.pt")
+
+    def load_A(self, client_id: int) -> dict:
+        return torch.load(f"{self.local_items}dp{client_id}_A.pt", map_location="cpu")
 
     def save_server(self, model, epoch):
-        torch.jit.save(torch.jit.script(model.cpu()), f"{self.central}server{epoch}.pt")
+        torch.save(model.cpu().state_dict(), f"{self.central}server{epoch}.pt")
 
     def load_server(self, epoch, device):
-        return torch.jit.load(f"{self.central}server{epoch}.pt", map_location=device)
+        # Reconstruct server model from state_dict; item_num / rank from saved weights
+        sd = torch.load(f"{self.central}server{epoch}.pt", map_location=device)
+        item_num   = sd["mlp_item_embeddings.weight"].shape[0]
+        embed_dim  = sd["mlp_item_embeddings.weight"].shape[1]
+        rank       = sd["B_mlp"].shape[1]
+        pred_factor = embed_dim // 2
+        model = ServerNeuralCollaborativeFiltering(item_num, pred_factor, rank).to(device)
+        model.load_state_dict(sd)
+        return model
 
 
-def fedavg(store: ModelStore, num_clients: int, server_model, epoch: int) -> float:
-    """FedAvg: average item-model weights from all clients, save as new server."""
+def colr_aggregate(store: ModelStore, num_clients: int,
+                   server_model: ServerNeuralCollaborativeFiltering,
+                   epoch: int) -> float:
+    """
+    CoLR aggregation:
+      1. Load A_n from each client  (small upload)
+      2. Average A_n → A_avg
+      3. Update server: I = I + B @ A_avg
+      4. Save updated server model
+    """
     t0 = time.time()
-    client_models = [store.load_item_model(i) for i in range(num_clients)]
 
-    avg_dict = copy.deepcopy(client_models[0].state_dict())
-    for cm in client_models[1:]:
-        for k, v in cm.state_dict().items():
-            avg_dict[k] += v
-    for k in avg_dict:
-        avg_dict[k] = avg_dict[k] / num_clients
+    A_mlp_sum = None
+    A_gmf_sum = None
+    for cid in range(num_clients):
+        d = store.load_A(cid)
+        if A_mlp_sum is None:
+            A_mlp_sum = d["A_mlp"].clone()
+            A_gmf_sum = d["A_gmf"].clone()
+        else:
+            A_mlp_sum.add_(d["A_mlp"])
+            A_gmf_sum.add_(d["A_gmf"])
 
-    server_model.load_state_dict(avg_dict)
+    A_mlp_avg = A_mlp_sum / num_clients
+    A_gmf_avg = A_gmf_sum / num_clients
+
+    server_model.update_with_A(A_mlp_avg, A_gmf_avg)
     store.save_server(server_model, epoch + 1)
     return time.time() - t0
 
@@ -110,7 +134,7 @@ class TeeLogger:
         sys.stdout = self._terminal
 
 
-# ── Federated NCF ─────────────────────────────────────────────────────────────
+# ── Federated NCF (CoLR) ──────────────────────────────────────────────────────
 
 class FederatedNCF:
     def __init__(self,
@@ -120,17 +144,17 @@ class FederatedNCF:
                  local_epochs:       int   = 1,
                  batch_size:         int   = 256,
                  latent_dim:         int   = 64,
+                 rank:               int   = 8,      # ← CoLR low-rank dimension
                  lr:                 float = 1e-4,
                  seed:               int   = 0,
                  device:             str   = None,
-                 eval_fraction:      float = 1.0,   # ← 0.0–1.0: fraction of clients evaluated
-                 eval_every:         int   = 1):     # ← evaluate every N epochs
+                 eval_fraction:      float = 1.0,
+                 eval_every:         int   = 1):
 
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
 
-        # Use passed device, or auto-detect
         if device is not None:
             self.device = torch.device(device)
         else:
@@ -145,8 +169,10 @@ class FederatedNCF:
         self.local_epochs       = local_epochs
         self.batch_size         = batch_size
         self.latent_dim         = latent_dim
+        self.rank               = rank
         self.lr                 = lr
         self.item_num           = train_matrix.shape[1]
+        self.embed_dim          = 2 * latent_dim
 
         self.store              = ModelStore()
         self.bandwidth_profiles = assign_bandwidth(num_clients, seed=seed)
@@ -154,24 +180,24 @@ class FederatedNCF:
         self.eval_log           = []
         self.timing_log         = []
 
-        # ── Eval subset ───────────────────────────────────────────────────────
         self.eval_every      = eval_every
         rng                  = np.random.default_rng(seed)
         n_eval               = max(1, int(num_clients * eval_fraction))
         self.eval_client_ids = rng.choice(num_clients, size=n_eval, replace=False).tolist()
 
-        # ── One client per user ───────────────────────────────────────────────
-        assert train_matrix.shape[0] == num_clients, \
-            f"num_clients={num_clients} must equal train_matrix rows={train_matrix.shape[0]}"
+        assert train_matrix.shape[0] == num_clients
 
         self.clients = [
             NCFTrainer(train_matrix[i:i+1], epochs=local_epochs,
                        batch_size=batch_size, latent_dim=latent_dim,
-                       device=self.device, global_user_offset=i)
+                       device=self.device, global_user_offset=i,
+                       rank=rank)                          # ← pass rank
             for i in range(num_clients)
         ]
         self.optimizers = [
-            torch.optim.Adam(c.ncf.parameters(), lr=lr) for c in self.clients
+            torch.optim.Adam(
+                filter(lambda p: p.requires_grad, c.ncf.parameters()), lr=lr
+            ) for c in self.clients
         ]
 
         # ── Logging ───────────────────────────────────────────────────────────
@@ -183,15 +209,21 @@ class FederatedNCF:
         self.logger   = TeeLogger(self.log_path)
         sys.stdout    = self.logger
 
+        # Communication size comparison
+        full_item_bits = self.item_num * self.embed_dim * 2 * 32  # mlp+gmf full embeddings
+        colr_bits      = a_matrix_size_bits(rank, self.embed_dim)
+        reduction_pct  = (1 - colr_bits / full_item_bits) * 100
+
         print(f"Log file : {self.log_path}")
         print(f"Started  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Device   : {self.device}")
         print(f"{'='*60}")
         print(f"Dataset       : ML-1M  |  Items: {self.item_num}")
-        print(f"Users         : {num_clients}  (same users train & test, leave-one-out split)")
+        print(f"Users         : {num_clients}")
         print(f"Local epochs  : {local_epochs}")
         print(f"Batch size    : {batch_size}")
         print(f"Latent dim    : {latent_dim}")
+        print(f"CoLR rank     : {rank}  (r << M={self.item_num})")
         print(f"Learning rate : {lr}")
         print(f"Bandwidth     : "
               f"{self.bandwidth_profiles.count('slow')} slow, "
@@ -200,10 +232,14 @@ class FederatedNCF:
         print(f"Eval fraction : {eval_fraction:.0%}  ({n_eval} / {num_clients} users)")
         print(f"Eval every    : every {eval_every} epoch(s)")
         print(f"{'='*60}")
+        print(f"[CoLR] Upload payload  : {colr_bits/8/1024:.2f} KB  (A matrices only)")
+        print(f"[CoLR] Full item embed : {full_item_bits/8/1024:.2f} KB")
+        print(f"[CoLR] Upload reduction: {reduction_pct:.1f}%")
+        print(f"{'='*60}")
 
     # ── Single training round ─────────────────────────────────────────────────
 
-    def _single_round(self, epoch: int, server_bits: int, item_bits: int) -> list:
+    def _single_round(self, epoch: int, server_bits: int, upload_bits: int) -> list:
         timings     = []
         agg_results = {"loss": [], "hit_ratio@10": [], "ndcg@10": []}
 
@@ -211,11 +247,12 @@ class FederatedNCF:
                    desc=f"Epoch {epoch}")
         for cid, client in bar:
             bw         = BANDWIDTH_PROFILES[self.bandwidth_profiles[cid]]
-            dl_time    = comm_time(server_bits, bw["download"])
+            dl_time    = comm_time(server_bits,  bw["download"])
             t0         = time.time()
             results    = client.train(self.optimizers[cid])
             train_time = time.time() - t0
-            ul_time    = comm_time(item_bits, bw["upload"])
+            # ← Upload is now only A matrices (CoLR)
+            ul_time    = comm_time(upload_bits, bw["upload"])
 
             timings.append({
                 "client_id":       cid,
@@ -228,8 +265,10 @@ class FederatedNCF:
             for key in ["loss", "hit_ratio@10", "ndcg@10"]:
                 agg_results[key].append(results[key])
 
+            # Save full client state (for eval) and A matrices (for aggregation)
             self.store.save_client(client.ncf, cid)
-            client.ncf.to(self.device)          # ← restore to device after save moves it to CPU
+            self.store.save_A(cid, client.ncf.A_mlp, client.ncf.A_gmf)
+            client.ncf.to(self.device)
 
             bar.set_postfix({"loss": f"{results['loss']:.4f}",
                              "HR@10": f"{results['hit_ratio@10']:.4f}"})
@@ -243,24 +282,9 @@ class FederatedNCF:
         })
         return timings
 
-    # ── Extract item-only models for aggregation ──────────────────────────────
-
-    def _extract_item_models(self):
-        for cid in range(self.num_clients):
-            full_model = torch.jit.load(f"./models/local/dp{cid}.pt")
-            item_model = ServerNeuralCollaborativeFiltering(
-                item_num=self.item_num, predictive_factor=self.latent_dim)
-            item_model.set_weights(full_model)
-            self.store.save_item_model(item_model, cid)
-
     # ── Standard evaluation ───────────────────────────────────────────────────
 
     def _evaluate(self, epoch: int, k: int = 10, n_neg: int = 99):
-        """
-        Evaluate every training client using their held-out test item.
-        Each client's model already has up-to-date weights from local training.
-        No fine-tuning needed — user embeddings were trained during local SGD.
-        """
         hrs, ndcgs, losses = [], [], []
         for cid in self.eval_client_ids:
             client = self.clients[cid]
@@ -318,33 +342,39 @@ class FederatedNCF:
 
     def train(self):
         server_model = ServerNeuralCollaborativeFiltering(
-            item_num=self.item_num, predictive_factor=self.latent_dim)
+            item_num=self.item_num, predictive_factor=self.latent_dim, rank=self.rank)
         self.store.save_server(server_model, 0)
 
         server_bits = model_size_bits(server_model)
-        item_bits   = server_bits
-        print(f"Server model size : {server_bits / 8 / 1024:.2f} KB")
+        upload_bits = a_matrix_size_bits(self.rank, self.embed_dim)
+        print(f"Server download size : {server_bits / 8 / 1024:.2f} KB")
+        print(f"Client upload size   : {upload_bits / 8 / 1024:.2f} KB  (CoLR A only)")
 
         for epoch in range(self.aggregation_epochs):
-            # 1. Distribute server item weights to all clients
+            # 1. Distribute server weights (updated I, shared B) to all clients
             sv = self.store.load_server(epoch, self.device)
             for client in self.clients:
-                client.ncf.to(self.device)      # ← ensure on device before loading weights
-                client.ncf.load_server_weights(sv)
+                client.ncf.to(self.device)
+                client.ncf.load_server_weights(sv)   # copies I, B, MLP; resets A; freezes I
+                # Rebuild optimizer to only include trainable params (A + user_emb)
+            self.optimizers = [
+                torch.optim.Adam(
+                    filter(lambda p: p.requires_grad, c.ncf.parameters()), lr=self.lr
+                ) for c in self.clients
+            ]
 
-            # 2. Local training (trains BOTH user embeddings AND item embeddings)
-            timings  = self._single_round(epoch, server_bits, item_bits)
+            # 2. Local training — each client trains A_n (+ user_emb), uploads A_n
+            timings  = self._single_round(epoch, server_bits, upload_bits)
 
-            # 3. Extract item-only models & FedAvg (user embeddings stay local)
-            self._extract_item_models()
-            agg_time = fedavg(self.store, self.num_clients, server_model, epoch)
+            # 3. CoLR aggregation: average A_n, update I = I + B @ A_avg
+            agg_time = colr_aggregate(self.store, self.num_clients, server_model, epoch)
 
             # 4. Print timing
             self._print_timing(epoch, timings, agg_time)
             self.timing_log.append({"epoch": epoch,
                                     "timings": timings, "agg_time": agg_time})
 
-            # 5. Evaluate only on selected epochs and fraction of users
+            # 5. Evaluate
             if (epoch + 1) % self.eval_every == 0 or epoch == self.aggregation_epochs - 1:
                 self._evaluate(epoch, k=10, n_neg=99)
 
@@ -358,7 +388,7 @@ class FederatedNCF:
         print(f"TRAINING COMPLETE — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'='*60}")
 
-        print(f"\n-- Training metrics (batch-level, reference only) --")
+        print(f"\n-- Training metrics --")
         print(f"{'Epoch':>6} | {'Loss':>8} | {'HR@10(train)':>12} | {'NDCG@10(train)':>14}")
         print("-" * 48)
         for m in self.metrics_log:
@@ -366,7 +396,7 @@ class FederatedNCF:
                   f"{m['hit_ratio@10']:>12.4f} | {m['ndcg@10']:>14.4f}")
 
         if self.eval_log:
-            print(f"\n-- Standard leave-one-out evaluation (1 pos + 99 neg, paper-standard) --")
+            print(f"\n-- Standard leave-one-out evaluation --")
             print(f"{'Epoch':>6} | {'HR@10':>8} | {'NDCG@10':>10} | {'EvalLoss':>10} | {'Users':>7}")
             print("-" * 52)
             for e in self.eval_log:
@@ -391,6 +421,14 @@ class FederatedNCF:
             print(f"Avg time / round : {total_round/len(self.timing_log):.4f}s")
             print(f"Total agg time   : {total_agg:.2f}s")
 
+        # CoLR communication summary
+        full_bits  = self.item_num * self.embed_dim * 2 * 32
+        colr_bits  = a_matrix_size_bits(self.rank, self.embed_dim)
+        n_rounds   = len(self.timing_log)
+        print(f"\n[CoLR] Upload per client/round : {colr_bits/8/1024:.2f} KB")
+        print(f"[CoLR] vs full item embed      : {full_bits/8/1024:.2f} KB")
+        print(f"[CoLR] Total upload saved      : "
+              f"{(full_bits-colr_bits)*self.num_clients*n_rounds/8/1024/1024:.2f} MB")
         print(f"\nLog saved → {self.log_path}")
         print(f"{'='*60}")
 
@@ -398,10 +436,6 @@ class FederatedNCF:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # ── Device: auto-detects GPU, falls back to CPU ───────────────────────────
-    # Colab (NVIDIA): "cuda"
-    # MacBook (Apple Silicon): "mps"
-    # MacBook (CPU):  "cpu"
     DEVICE = (
         "cuda" if torch.cuda.is_available() else
         "mps"  if torch.backends.mps.is_available() else
@@ -410,7 +444,7 @@ if __name__ == "__main__":
     print(f"Using device: {DEVICE}")
 
     dataloader   = MovielensDatasetLoader()
-    all_ratings  = dataloader.ratings          # (6040, 3706)
+    all_ratings  = dataloader.ratings
 
     n_clients    = 604
     train_matrix = all_ratings[:n_clients]
@@ -422,23 +456,11 @@ if __name__ == "__main__":
         local_epochs       = 2,
         batch_size         = 256,
         latent_dim         = 64,
+        rank               = 16,      # ← CoLR rank; try 4, 8, 16, 32
         lr                 = 5e-4,
         seed               = 42,
         device             = DEVICE,
-        eval_fraction      = 0.2,   # evaluate on 20% of users (~121) — fast
-        eval_every         = 5,     # evaluate every 5 epochs
+        eval_fraction      = 0.2,
+        eval_every         = 5,
     )
     fncf.train()
-    
-	# fncf = FederatedNCF(
-    #     train_matrix       = train_matrix,
-    #     num_clients        = n_clients,
-    #     aggregation_epochs = 50,
-    #     local_epochs       = 2, # lower 
-    #     batch_size         = 256, # lower
-    #     latent_dim         = 64, 
-    #     lr                 = 5e-4, # lower
-    #     seed               = 42,
-    #     device             = DEVICE,           # ← pass device explicitly
-    # )
-    # fncf.train()
