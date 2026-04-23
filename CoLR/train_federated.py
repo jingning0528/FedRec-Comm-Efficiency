@@ -58,10 +58,13 @@ class ModelStore:
     def load_client_state(self, client_id):
         return torch.load(f"{self.local}dp{client_id}.pt", map_location="cpu")
 
-    def save_A(self, client_id: int, A_mlp: torch.Tensor, A_gmf: torch.Tensor):
-        """Save only the low-rank A matrices for a client (CoLR upload payload)."""
-        torch.save({"A_mlp": A_mlp.detach().cpu(),
-                    "A_gmf": A_gmf.detach().cpu()},
+    def save_A(self, client_id: int, A_mlp: torch.Tensor, A_gmf: torch.Tensor,
+               shared_weights: dict):
+        """Save low-rank A matrices + shared MLP weights (CoLR upload payload)."""
+        torch.save({"A_mlp":          A_mlp.detach().cpu(),
+                    "A_gmf":          A_gmf.detach().cpu(),
+                    "shared_weights": {k: v.detach().cpu()
+                                       for k, v in shared_weights.items()}},
                    f"{self.local_items}dp{client_id}_A.pt")
 
     def load_A(self, client_id: int) -> dict:
@@ -82,33 +85,47 @@ class ModelStore:
         return model
 
 
+def _get_shared_weights(ncf) -> dict:
+    """Extract MLP + output layer weights that should be FedAvg-ed."""
+    keys = [n for n, _ in ncf.named_parameters()
+            if not any(x in n for x in ("user_embedding", "item_embedding", "A_mlp", "A_gmf"))]
+    return {k: ncf.state_dict()[k].clone() for k in keys}
+
+
 def colr_aggregate(store: ModelStore, num_clients: int,
                    server_model: ServerNeuralCollaborativeFiltering,
                    epoch: int) -> float:
     """
     CoLR aggregation:
-      1. Load A_n from each client  (small upload)
-      2. Average A_n → A_avg
-      3. Update server: I = I + B @ A_avg
+      1. Load A_n + MLP weights from each client
+      2. Average A_n → A_avg  ;  Average MLP → MLP_avg
+      3. Update server: I = I + B @ A_avg  ;  server.MLP = MLP_avg
       4. Save updated server model
     """
     t0 = time.time()
 
-    A_mlp_sum = None
-    A_gmf_sum = None
+    A_mlp_sum   = None
+    A_gmf_sum   = None
+    mlp_sum     = None
+
     for cid in range(num_clients):
         d = store.load_A(cid)
         if A_mlp_sum is None:
             A_mlp_sum = d["A_mlp"].clone()
             A_gmf_sum = d["A_gmf"].clone()
+            mlp_sum   = {k: v.clone() for k, v in d["shared_weights"].items()}
         else:
             A_mlp_sum.add_(d["A_mlp"])
             A_gmf_sum.add_(d["A_gmf"])
+            for k in mlp_sum:
+                mlp_sum[k].add_(d["shared_weights"][k])
 
     A_mlp_avg = A_mlp_sum / num_clients
     A_gmf_avg = A_gmf_sum / num_clients
+    mlp_avg   = {k: v / num_clients for k, v in mlp_sum.items()}
 
     server_model.update_with_A(A_mlp_avg, A_gmf_avg)
+    server_model.update_shared_weights(mlp_avg)          # ← new
     store.save_server(server_model, epoch + 1)
     return time.time() - t0
 
@@ -251,7 +268,6 @@ class FederatedNCF:
             t0         = time.time()
             results    = client.train(self.optimizers[cid])
             train_time = time.time() - t0
-            # ← Upload is now only A matrices (CoLR)
             ul_time    = comm_time(upload_bits, bw["upload"])
 
             timings.append({
@@ -265,9 +281,10 @@ class FederatedNCF:
             for key in ["loss", "hit_ratio@10", "ndcg@10"]:
                 agg_results[key].append(results[key])
 
-            # Save full client state (for eval) and A matrices (for aggregation)
+            # Save A matrices + shared MLP weights for aggregation
             self.store.save_client(client.ncf, cid)
-            self.store.save_A(cid, client.ncf.A_mlp, client.ncf.A_gmf)
+            self.store.save_A(cid, client.ncf.A_mlp, client.ncf.A_gmf,
+                              _get_shared_weights(client.ncf))     # ← pass MLP weights
             client.ncf.to(self.device)
 
             bar.set_postfix({"loss": f"{results['loss']:.4f}",

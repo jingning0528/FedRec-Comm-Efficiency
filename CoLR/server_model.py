@@ -68,6 +68,12 @@ class ServerNeuralCollaborativeFiltering(torch.nn.Module):
         copy_(model.mlp_out,             self.mlp_out)
         copy_(model.output_logits,       self.output_logits)
 
+    def update_shared_weights(self, averaged_weights: dict):
+        """FedAvg the MLP + output layer weights from clients."""
+        sd = self.state_dict()
+        sd.update(averaged_weights)
+        self.load_state_dict(sd)
+
     def forward(self):
         return torch.tensor(0.0)
 
