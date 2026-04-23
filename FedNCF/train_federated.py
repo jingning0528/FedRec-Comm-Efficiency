@@ -154,10 +154,13 @@ class FederatedNCF:
         self.eval_log           = []
         self.timing_log         = []
 
-        # ── One client per user — leave-one-out split happens inside NCFTrainer ──
-        # train_matrix[i] → NCFTrainer splits it into:
-        #   - train interactions (all except held-out item)  → used for local SGD
-        #   - test item (held-out)                           → used for evaluate_standard()
+        # ── Eval subset ───────────────────────────────────────────────────────
+        self.eval_every      = eval_every
+        rng                  = np.random.default_rng(seed)
+        n_eval               = max(1, int(num_clients * eval_fraction))
+        self.eval_client_ids = rng.choice(num_clients, size=n_eval, replace=False).tolist()
+
+        # ── One client per user ───────────────────────────────────────────────
         assert train_matrix.shape[0] == num_clients, \
             f"num_clients={num_clients} must equal train_matrix rows={train_matrix.shape[0]}"
 
@@ -417,7 +420,7 @@ if __name__ == "__main__":
         train_matrix       = train_matrix,
         num_clients        = n_clients,
         aggregation_epochs = 50,
-        local_epochs       = 1,
+        local_epochs       = 2,
         batch_size         = 256,
         latent_dim         = 64,
         lr                 = 1e-4,
