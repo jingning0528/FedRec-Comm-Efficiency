@@ -16,10 +16,16 @@ from dataloader import MovielensDatasetLoader
 # ── Bandwidth simulation ──────────────────────────────────────────────────────
 
 BANDWIDTH_PROFILES = {
-    "slow":   {"upload":  1,  "download":  2},   # 30%
-    "medium": {"upload": 10,  "download": 20},   # 40%
-    "fast":   {"upload": 50,  "download": 100},  # 30%
+    "slow":   {"upload": 100,  "download": 100},   # 30%
+    "medium": {"upload": 100,  "download": 100},   # 40%
+    "fast":   {"upload": 100,  "download": 100},  # 30%
 }
+
+# BANDWIDTH_PROFILES = {
+#     "slow":   {"upload":  1,  "download":  2},   # 30%
+#     "medium": {"upload": 10,  "download": 20},   # 40%
+#     "fast":   {"upload": 50,  "download": 100},  # 30%
+# }
 
 def assign_bandwidth(num_clients: int, seed: int = 0) -> list:
     rng = random.Random(seed)
@@ -108,15 +114,17 @@ class TeeLogger:
 
 class FederatedNCF:
     def __init__(self,
-                 train_matrix:  np.ndarray,
-                 num_clients:   int   = 604,
-                 aggregation_epochs: int = 50,
-                 local_epochs:  int   = 5,
-                 batch_size:    int   = 128,
-                 latent_dim:    int   = 32,
-                 lr:            float = 1e-3,
-                 seed:          int   = 0,
-                 device:        str   = None):   # ← NEW
+                 train_matrix:       np.ndarray,
+                 num_clients:        int   = 604,
+                 aggregation_epochs: int   = 50,
+                 local_epochs:       int   = 1,
+                 batch_size:         int   = 256,
+                 latent_dim:         int   = 64,
+                 lr:                 float = 1e-4,
+                 seed:               int   = 0,
+                 device:             str   = None,
+                 eval_fraction:      float = 1.0,   # ← 0.0–1.0: fraction of clients evaluated
+                 eval_every:         int   = 1):     # ← evaluate every N epochs
 
         random.seed(seed)
         np.random.seed(seed)
@@ -186,6 +194,8 @@ class FederatedNCF:
               f"{self.bandwidth_profiles.count('slow')} slow, "
               f"{self.bandwidth_profiles.count('medium')} medium, "
               f"{self.bandwidth_profiles.count('fast')} fast")
+        print(f"Eval fraction : {eval_fraction:.0%}  ({n_eval} / {num_clients} users)")
+        print(f"Eval every    : every {eval_every} epoch(s)")
         print(f"{'='*60}")
 
     # ── Single training round ─────────────────────────────────────────────────
@@ -249,9 +259,10 @@ class FederatedNCF:
         No fine-tuning needed — user embeddings were trained during local SGD.
         """
         hrs, ndcgs, losses = [], [], []
-        for client in self.clients:
-            res = client.evaluate_standard(n_neg=n_neg, k=k)
-            n   = res["evaluated_users"]
+        for cid in self.eval_client_ids:
+            client = self.clients[cid]
+            res    = client.evaluate_standard(n_neg=n_neg, k=k)
+            n      = res["evaluated_users"]
             if n > 0:
                 hrs.extend(   [res[f"hr@{k}"]]   * n)
                 ndcgs.extend( [res[f"ndcg@{k}"]] * n)
@@ -273,7 +284,7 @@ class FederatedNCF:
 
         print(f"\n[Standard Eval — Epoch {epoch:>3d}]  "
               f"HR@{k} = {hr_mean:.4f}  |  NDCG@{k} = {ndcg_mean:.4f}  |  "
-              f"Eval Loss = {loss_mean:.4f}  ({total_n} users)\n")
+              f"Eval Loss = {loss_mean:.4f}  ({total_n} / {self.num_clients} users)\n")
         return record
 
     # ── Timing summary ────────────────────────────────────────────────────────
@@ -330,8 +341,9 @@ class FederatedNCF:
             self.timing_log.append({"epoch": epoch,
                                     "timings": timings, "agg_time": agg_time})
 
-            # 5. Standard evaluation on held-out test items
-            self._evaluate(epoch, k=10, n_neg=99)
+            # 5. Evaluate only on selected epochs and fraction of users
+            if (epoch + 1) % self.eval_every == 0 or epoch == self.aggregation_epochs - 1:
+                self._evaluate(epoch, k=10, n_neg=99)
 
         self._final_summary()
         self.logger.close()
@@ -398,17 +410,33 @@ if __name__ == "__main__":
     all_ratings  = dataloader.ratings          # (6040, 3706)
 
     n_clients    = 604
+	#n_clients    = 604
     train_matrix = all_ratings[:n_clients]
 
     fncf = FederatedNCF(
         train_matrix       = train_matrix,
         num_clients        = n_clients,
         aggregation_epochs = 50,
-        local_epochs       = 2,
+        local_epochs       = 1,
         batch_size         = 256,
         latent_dim         = 64,
-        lr                 = 5e-4,
+        lr                 = 1e-4,
         seed               = 42,
-        device             = DEVICE,           # ← pass device explicitly
+        device             = DEVICE,
+        eval_fraction      = 0.2,   # evaluate on 20% of users (~121) — fast
+        eval_every         = 5,     # evaluate every 5 epochs
     )
     fncf.train()
+    
+	# fncf = FederatedNCF(
+    #     train_matrix       = train_matrix,
+    #     num_clients        = n_clients,
+    #     aggregation_epochs = 50,
+    #     local_epochs       = 2, # lower 
+    #     batch_size         = 256, # lower
+    #     latent_dim         = 64, 
+    #     lr                 = 5e-4, # lower
+    #     seed               = 42,
+    #     device             = DEVICE,           # ← pass device explicitly
+    # )
+    # fncf.train()
