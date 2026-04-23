@@ -216,6 +216,8 @@ class FederatedNCF:
                 agg_results[key].append(results[key])
 
             self.store.save_client(client.ncf, cid)
+            client.ncf.to(self.device)          # ← restore to device after save moves it to CPU
+
             bar.set_postfix({"loss": f"{results['loss']:.4f}",
                              "HR@10": f"{results['hit_ratio@10']:.4f}"})
         bar.close()
@@ -313,6 +315,7 @@ class FederatedNCF:
             # 1. Distribute server item weights to all clients
             sv = self.store.load_server(epoch, self.device)
             for client in self.clients:
+                client.ncf.to(self.device)      # ← ensure on device before loading weights
                 client.ncf.load_server_weights(sv)
 
             # 2. Local training (trains BOTH user embeddings AND item embeddings)
