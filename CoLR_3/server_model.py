@@ -5,39 +5,35 @@ from .low_rank import LowRankLinear
 
 class ServerNeuralCollaborativeFiltering(torch.nn.Module):
     """
-    Server-side model for SCoLR (Algorithm 2).
+    Server-side model for CoLR (Algorithm 1).
 
     Per-round protocol:
-      1.  Merge previous delta:  Q(t) = Q(t-1) + B(t-1) @ A(t).T
-      2.  Sample new B(t) ~ D_B  (re-sampled every round)
-      3.  Broadcast Q(t), B(t)[:, :rank_u],  MLP weights to each client.
-      4.  Clients: freeze Q_base + B, init A=0, train A + user embs.
-      5.  Clients upload: {S_u,  A_u[S_u]}  (sparse, rank_u columns).
-      6.  Server aggregates sparse deltas in Q-space and updates Q.
+      1.  Sample B(t) ~ D_B  (new random basis each round)
+      2.  Broadcast Q(t) [dense], B(t), MLP weights to all clients.
+      3.  Clients: copy Q→Q_base, copy B, reset A=0, train {A_u, p_u}.
+      4.  Clients upload: A_u (full, all items).
+      5.  Server aggregates: A(t+1) = Σ (N_u/N) * A_u
+      6.  Server merges:     Q(t+1) = Q(t) + B(t) @ A(t+1).T
+          (ready for next round broadcast)
     """
 
-    def __init__(self, item_num: int, predictive_factor: int = 32,
-                 rank: int = 16):
+    def __init__(self, item_num: int, predictive_factor: int = 32, rank: int = 16):
         super().__init__()
         pf            = predictive_factor
-        self.rank     = rank          # global / max rank  r_g
+        self.rank     = rank
         self.item_num = item_num
         self.pf       = pf
 
-        # ── Dense item embeddings Q (Algorithm 2: maintained on server) ───────
-        self.Q_mlp = torch.nn.Parameter(
-            torch.empty(item_num, 2 * pf))
-        self.Q_gmf = torch.nn.Parameter(
-            torch.empty(item_num, 2 * pf))
+        # ── Dense item embeddings Q — merged each round (Alg 1, line 7) ──────
+        self.Q_mlp = torch.nn.Parameter(torch.empty(item_num, 2 * pf))
+        self.Q_gmf = torch.nn.Parameter(torch.empty(item_num, 2 * pf))
         torch.nn.init.normal_(self.Q_mlp, std=0.01)
         torch.nn.init.normal_(self.Q_gmf, std=0.01)
 
-        # ── Current-round B matrices (re-sampled each round) ──────────────────
-        # Stored as buffers so they travel with .to(device) but aren't optimised
-        self.register_buffer('B_mlp',
-            torch.empty(2 * pf, rank))
-        self.register_buffer('B_gmf',
-            torch.empty(2 * pf, rank))
+        # ── Current-round B matrices — re-sampled each round (Alg 1, line 3) ─
+        # Registered as buffers: move with .to(device) but not optimised
+        self.register_buffer('B_mlp', torch.empty(2 * pf, rank))
+        self.register_buffer('B_gmf', torch.empty(2 * pf, rank))
         self._sample_B_inplace(self.B_mlp)
         self._sample_B_inplace(self.B_gmf)
 
@@ -61,13 +57,14 @@ class ServerNeuralCollaborativeFiltering(torch.nn.Module):
 
     @staticmethod
     def _sample_B_inplace(B: torch.Tensor):
-        """Sample B ~ N(0, 1/sqrt(rank))  — paper D_B distribution."""
+        """Sample B ~ N(0, 1/sqrt(rank)) — paper D_B distribution."""
         rank = B.shape[1]
         torch.nn.init.normal_(B, std=1.0 / math.sqrt(rank))
 
     def sample_new_B(self):
         """
-        Algorithm 2, line 2: sample B(t) ~ D_B  (called once per round).
+        Algorithm 1, line 3: sample B(t) ~ D_B (called once per round,
+        BEFORE broadcasting to clients).
         """
         self._sample_B_inplace(self.B_mlp)
         self._sample_B_inplace(self.B_gmf)
@@ -78,51 +75,43 @@ class ServerNeuralCollaborativeFiltering(torch.nn.Module):
              (1 - self.model_blending) * self.mlp_out.weight), dim=1))
         self.output_logits.weight = W
 
-    # ── Aggregation + merge (Algorithm 2, lines 16 + next-round merge) ───────
+    # ── Aggregation + merge (Algorithm 1, lines 18 + 7) ──────────────────────
 
     def aggregate_and_merge(self,
-                            client_sparse_As: list,   # list of dicts from get_sparse_item_A()
-                            client_n_items:   list,   # N_u per client
-                            client_shared:    list,   # MLP + output head weights
+                            client_mlp_As: list,   # list of (item_num, rank) tensors
+                            client_gmf_As: list,
+                            client_n_items: list,  # N_u per client
+                            client_shared:  list,  # MLP + output head weight dicts
                             ):
         """
-        Algorithm 2, lines 16 & 5 combined:
+        Algorithm 1, lines 18 (aggregate) and 7 (merge):
 
-          delta_Q = Σ_u (N_u/N) * scatter(A_u[S_u] @ B_u.T,  S_u,  item_num)
-          Q(t+1)  = Q(t) + delta_Q          ← merge into dense Q
+          A(t+1)  = Σ_u (N_u/N) * A_u(t)          ← weighted FedAvg on A
+          Q(t+1)  = Q(t) + B(t) @ A(t+1).T         ← merge delta into dense Q
 
-        Handles heterogeneous ranks: each client contributes in Q-space so
-        rank differences are transparent to the server.
+        B(t) used here is the CURRENT round's B (same B clients trained with).
+        After merge, Q(t+1) is ready to broadcast next round.
         Also averages MLP tower + output heads (standard FedAvg).
         """
         total_n = sum(client_n_items)
         dev     = self.Q_mlp.device
 
-        # ── Sparse delta in Q-space ───────────────────────────────────────────
-        delta_mlp = torch.zeros_like(self.Q_mlp)   # (item_num, 2*pf)
-        delta_gmf = torch.zeros_like(self.Q_gmf)
+        # ── Aggregate A: weighted FedAvg (Alg 1, line 18) ────────────────────
+        A_mlp_agg = torch.zeros(self.item_num, self.rank, device=dev)
+        A_gmf_agg = torch.zeros(self.item_num, self.rank, device=dev)
 
-        for sparse_A, n in zip(client_sparse_As, client_n_items):
-            w      = n / total_n
-            Su     = sparse_A["Su"].to(dev)                  # (|S_u|,)
-            rank_u = sparse_A["rank"]
+        for mlp_A, gmf_A, n in zip(client_mlp_As, client_gmf_As, client_n_items):
+            w = n / total_n
+            A_mlp_agg += w * mlp_A.to(dev)
+            A_gmf_agg += w * gmf_A.to(dev)
 
-            # A_u[S_u] @ B[:, :rank_u].T  →  (|S_u|, 2*pf)
-            A_mlp_u = sparse_A["mlp_A"].to(dev)              # (|S_u|, rank_u)
-            A_gmf_u = sparse_A["gmf_A"].to(dev)
+        # ── Merge: Q(t+1) = Q(t) + B(t) @ A(t+1).T  (Alg 1, line 7) ────────
+        # B_mlp : (2*pf, rank),  A_mlp_agg : (item_num, rank)
+        # B @ A.T → (2*pf, item_num) → .T → (item_num, 2*pf)
+        self.Q_mlp.data.add_((self.B_mlp @ A_mlp_agg.T).T)
+        self.Q_gmf.data.add_((self.B_gmf @ A_gmf_agg.T).T)
 
-            dq_mlp = A_mlp_u @ self.B_mlp[:, :rank_u].T     # (|S_u|, 2*pf)
-            dq_gmf = A_gmf_u @ self.B_gmf[:, :rank_u].T
-
-            # Scatter weighted delta into full item dimension
-            delta_mlp.index_add_(0, Su, w * dq_mlp)
-            delta_gmf.index_add_(0, Su, w * dq_gmf)
-
-        # ── Merge: Q(t+1) = Q(t) + delta ─────────────────────────────────────
-        self.Q_mlp.data.add_(delta_mlp)
-        self.Q_gmf.data.add_(delta_gmf)
-
-        # ── FedAvg on MLP tower + output heads (standard, unchanged) ─────────
+        # ── FedAvg on MLP tower + output heads ────────────────────────────────
         num = len(client_shared)
         avg_mlp = {k: torch.zeros_like(v)
                    for k, v in client_shared[0]["mlp_state"].items()}

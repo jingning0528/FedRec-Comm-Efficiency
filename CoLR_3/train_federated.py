@@ -14,18 +14,10 @@ from dataloader import MovielensDatasetLoader
 # ── Bandwidth simulation ──────────────────────────────────────────────────────
 
 BANDWIDTH_PROFILES = {
-    "slow":   {"upload":  1,  "download":  2},   # 30%
-    "medium": {"upload": 10,  "download": 20},   # 40%
-    "fast":   {"upload": 50,  "download": 100},  # 30%
+    "slow":   {"upload": 100, "download": 100},
+    "medium": {"upload": 100, "download": 100},
+    "fast":   {"upload": 100, "download": 100},
 }
-
-# SCoLR: per-client rank determined by bandwidth profile
-# slow → r_g // 4,  medium → r_g // 2,  fast → r_g
-RANK_FRACTION = {"slow": 0.25, "medium": 0.5, "fast": 1.0}
-
-
-def get_client_rank(bandwidth_label: str, global_rank: int) -> int:
-    return max(1, int(global_rank * RANK_FRACTION[bandwidth_label]))
 
 
 def assign_bandwidth(num_clients: int, seed: int = 0) -> list:
@@ -68,53 +60,49 @@ class TeeLogger:
 
 # ── Communication cost helpers ────────────────────────────────────────────────
 
-def _upload_bits_scolr(n_interacted: int, rank_u: int,
-                       latent_dim: int, global_rank: int) -> int:
+def _upload_bits(item_num: int, latent_dim: int, rank: int) -> int:
     """
-    SCoLR upload per client (Algorithm 2, line 14):
-      - Sparse A[S_u]:  |S_u| × rank_u  (mlp + gmf)
-      - S_u indices:    |S_u|  (int32)
+    CoLR upload per client (Algorithm 1, line 16):
+      - Full A_u (mlp + gmf):  item_num × rank × 2
       - MLP LowRankLinear factors + output heads
+    B is NOT uploaded (server keeps its own B).
     """
     pf   = latent_dim
     bits = 0
-    # Sparse item A (mlp + gmf)
-    bits += n_interacted * rank_u * 2 * 32
-    # S_u indices
-    bits += n_interacted * 2 * 32
-    # MLP
+    # Full item A (mlp + gmf) — NOT sparse (that is SCoLR's optimisation)
+    bits += item_num * rank * 2 * 32
+    # MLP 3 layers
     mlp_dims = [(4*pf, 2*pf), (2*pf, pf), (pf, pf//2)]
     for (in_f, out_f) in mlp_dims:
-        bits += (out_f * global_rank + in_f * global_rank + out_f) * 32
+        bits += (out_f * rank + in_f * rank + out_f) * 32
     # output heads
     bits += (2*pf + pf//2 + pf + 1) * 32
     return bits
 
 
-def _download_bits_scolr(item_num: int, rank_u: int, latent_dim: int,
-                          global_rank: int) -> int:
+def _download_bits(item_num: int, latent_dim: int, rank: int) -> int:
     """
-    SCoLR download per client (Algorithm 2, lines 5 + 8):
+    CoLR download per client (Algorithm 1, lines 9-10):
       - Q dense (mlp + gmf):  item_num × 2*pf × 2
-      - B[:, :rank_u] (mlp + gmf): 2*pf × rank_u × 2
+      - B (mlp + gmf):        2*pf × rank × 2
       - MLP + output heads
     """
     pf   = latent_dim
     bits = 0
     # Q dense (mlp + gmf)
     bits += item_num * 2 * pf * 2 * 32
-    # B slice (mlp + gmf)
-    bits += 2 * pf * rank_u * 2 * 32
-    # MLP
+    # B (mlp + gmf)
+    bits += 2 * pf * rank * 2 * 32
+    # MLP 3 layers
     mlp_dims = [(4*pf, 2*pf), (2*pf, pf), (pf, pf//2)]
     for (in_f, out_f) in mlp_dims:
-        bits += (out_f * global_rank + in_f * global_rank + out_f) * 32
+        bits += (out_f * rank + in_f * rank + out_f) * 32
     # output heads
     bits += (2*pf + pf//2 + pf + 1) * 32
     return bits
 
 
-# ── Federated NCF (SCoLR) ─────────────────────────────────────────────────────
+# ── Federated NCF (Algorithm 1 faithful CoLR) ────────────────────────────────
 
 class FederatedNCF:
     def __init__(self,
@@ -124,7 +112,7 @@ class FederatedNCF:
                  local_epochs:       int   = 1,
                  batch_size:         int   = 256,
                  latent_dim:         int   = 64,
-                 rank:               int   = 16,   # global rank r_g
+                 rank:               int   = 16,
                  lr:                 float = 1e-4,
                  seed:               int   = 0,
                  device:             str   = None,
@@ -144,7 +132,7 @@ class FederatedNCF:
         self.local_epochs       = local_epochs
         self.batch_size         = batch_size
         self.latent_dim         = latent_dim
-        self.global_rank        = rank
+        self.rank               = rank
         self.lr                 = lr
         self.item_num           = train_matrix.shape[1]
         self.metrics_log        = []
@@ -161,36 +149,23 @@ class FederatedNCF:
         self.client_n_items = [int((train_matrix[i] > 0).sum())
                                for i in range(num_clients)]
 
-        self.bandwidth_profiles = assign_bandwidth(num_clients, seed=seed)
-
-        # Per-client ranks based on bandwidth
-        self.client_ranks = [
-            get_client_rank(bw, rank)
-            for bw in self.bandwidth_profiles
-        ]
-
-        # Interacted item indices per client (S_u for sparse upload)
-        self.client_interacted = [
-            np.where(train_matrix[i] > 0)[0]
-            for i in range(num_clients)
-        ]
-
-        # Create clients with their own bandwidth-determined rank
         self.clients = [
             NCFTrainer(train_matrix[i:i+1], epochs=local_epochs,
                        batch_size=batch_size, latent_dim=latent_dim,
-                       rank=self.client_ranks[i],
-                       device=self.device, global_user_offset=i)
+                       rank=rank, device=self.device, global_user_offset=i)
             for i in range(num_clients)
         ]
         self.optimizers = [
             torch.optim.Adam(c.ncf.parameters(), lr=lr) for c in self.clients
         ]
+        self.bandwidth_profiles = assign_bandwidth(num_clients, seed=seed)
 
         # ── Comm cost report ──────────────────────────────────────────────────
-        avg_interacted = int(np.mean([len(s) for s in self.client_interacted]))
-        bw_counts      = {bw: self.bandwidth_profiles.count(bw) for bw in BANDWIDTH_PROFILES}
-        rank_counts    = {bw: get_client_rank(bw, rank) for bw in BANDWIDTH_PROFILES}
+        ul_bits        = _upload_bits(self.item_num, latent_dim, rank)
+        dl_bits        = _download_bits(self.item_num, latent_dim, rank)
+        # Full-rank baseline: item_num × embedding_dim × 2 (mlp + gmf)
+        full_rank_bits = self.item_num * 2 * latent_dim * 2 * 32
+        saving_ul      = 100.0 * (1 - ul_bits / full_rank_bits)
 
         # ── Logging ───────────────────────────────────────────────────────────
         root      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -205,23 +180,18 @@ class FederatedNCF:
         print(f"Started   : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Device    : {self.device}")
         print(f"{'='*60}")
-        print(f"Method        : SCoLR (Algorithm 2 — heterogeneous rank)")
+        print(f"Method        : CoLR (Algorithm 1 — B re-sampled every round)")
         print(f"Dataset       : ML-1M  |  Items: {self.item_num}")
         print(f"Users         : {num_clients}")
         print(f"Local epochs  : {local_epochs}")
         print(f"Batch size    : {batch_size}")
         print(f"Latent dim    : {latent_dim}")
-        print(f"Global rank   : {rank}  (r_g)")
-        print(f"Client ranks  :")
-        for bw, cnt in bw_counts.items():
-            r_u = rank_counts[bw]
-            ul  = _upload_bits_scolr(avg_interacted, r_u, latent_dim, rank)
-            dl  = _download_bits_scolr(self.item_num, r_u, latent_dim, rank)
-            print(f"  {bw:6s}  n={cnt:3d}  rank={r_u:2d}  "
-                  f"UL≈{ul/8/1024:.1f}KB  DL≈{dl/8/1024:.1f}KB")
-        print(f"Avg interacted items / client: {avg_interacted}")
-        print(f"Sparse upload: only S_u (interacted items) of A")
-        print(f"B re-sampled every round from N(0, 1/sqrt(r_g))")
+        print(f"CoLR rank     : {rank}")
+        print(f"Upload/client : {ul_bits/8/1024:.2f} KB  "
+              f"(full A, saving {saving_ul:.1f}% vs full-rank)")
+        print(f"Download/cl.  : {dl_bits/8/1024:.2f} KB  (dense Q + B + MLP)")
+        print(f"Aggregation   : weighted FedAvg on A; merge Q = Q + B @ A.T")
+        print(f"B sampling    : re-sampled from N(0, 1/sqrt(r)) EVERY round")
         print(f"Learning rate : {lr}")
         print(f"Eval fraction : {eval_fraction:.0%}  ({n_eval} / {num_clients} users)")
         print(f"Eval every    : every {eval_every} epoch(s)")
@@ -229,60 +199,53 @@ class FederatedNCF:
 
     # ── Single training round ─────────────────────────────────────────────────
 
-    def _single_round(self, epoch: int, server_model) -> tuple:
+    def _single_round(self, epoch: int, server_model,
+                      dl_bits: int, ul_bits: int) -> tuple:
         """
-        SCoLR per-round (Algorithm 2):
+        CoLR per-round (Algorithm 1):
           For each client u:
-            1. Receive Q(t) + B(t)[:, :rank_u] + MLP
-            2. reset A=0, freeze Q_base + B
-            3. Train A_u + user embs locally
-            4. Upload {S_u, A_u[S_u]} (sparse)
+            1. Receive Q(t) [dense] + B(t) + MLP  (Alg 1, lines 9-10)
+            2. Reset A=0, freeze Q_base + B        (Alg 1, line 10-11)
+            3. Train {A_u, p_u} locally            (Alg 1, lines 12-14)
+            4. Upload full A_u                     (Alg 1, line 16)
         """
-        timings          = []
-        agg_results      = {"loss": [], "hit_ratio@10": [], "ndcg@10": []}
-        client_sparse_As = []
-        client_shared    = []
+        timings       = []
+        agg_results   = {"loss": [], "hit_ratio@10": [], "ndcg@10": []}
+        client_mlp_As = []
+        client_gmf_As = []
+        client_shared = []
 
         bar = tqdm(enumerate(self.clients), total=self.num_clients,
                    desc=f"Epoch {epoch}")
         for cid, client in bar:
             bw      = BANDWIDTH_PROFILES[self.bandwidth_profiles[cid]]
-            rank_u  = self.client_ranks[cid]
-            Su      = self.client_interacted[cid]
-
-            dl_bits = _download_bits_scolr(
-                self.item_num, rank_u, self.latent_dim, self.global_rank)
             dl_time = comm_time(dl_bits, bw["download"])
 
-            # ── SCoLR: receive Q + B[:, :rank_u] + MLP ───────────────────────
+            # ── Alg 1, lines 9-10: receive Q(t) + B(t), copy to client ───────
             client.ncf.to(self.device)
-            client.ncf.load_server_weights(server_model, rank_u=rank_u)
+            client.ncf.load_server_weights(server_model)
 
-            # ── Reset A=0, freeze Q_base + B ─────────────────────────────────
+            # ── Alg 1, lines 10-11: reset A=0, freeze Q_base + B ─────────────
             client.ncf.prepare_for_local_train()
 
-            # ── Local training ────────────────────────────────────────────────
+            # ── Alg 1, lines 12-14: local training of {A_u, p_u} ─────────────
             t0         = time.time()
             results    = client.train(self.optimizers[cid])
             train_time = time.time() - t0
 
-            # ── Collect sparse A[S_u] for upload ─────────────────────────────
-            sparse_A = client.ncf.get_sparse_item_A(Su)
-            client_sparse_As.append(sparse_A)
+            # ── Collect full A_u + shared weights for upload ──────────────────
+            a_dict = client.ncf.get_item_A()
+            client_mlp_As.append(a_dict["mlp_A"])
+            client_gmf_As.append(a_dict["gmf_A"])
             client_shared.append(client.ncf.get_shared_weights())
 
-            # ── Restore all grads for next round's weight loading ─────────────
+            # ── Unfreeze for next round's weight loading ──────────────────────
             client.ncf.unfreeze_all()
 
-            ul_bits = _upload_bits_scolr(
-                len(Su), rank_u, self.latent_dim, self.global_rank)
             ul_time = comm_time(ul_bits, bw["upload"])
-
             timings.append({
                 "client_id":       cid,
                 "bandwidth":       self.bandwidth_profiles[cid],
-                "rank_u":          rank_u,
-                "su_size":         len(Su),
                 "download_time_s": round(dl_time,    4),
                 "train_time_s":    round(train_time, 4),
                 "upload_time_s":   round(ul_time,    4),
@@ -291,9 +254,8 @@ class FederatedNCF:
             for key in ["loss", "hit_ratio@10", "ndcg@10"]:
                 agg_results[key].append(results[key])
 
-            bar.set_postfix({"loss":  f"{results['loss']:.4f}",
-                             "HR@10": f"{results['hit_ratio@10']:.4f}",
-                             "rank":  rank_u})
+            bar.set_postfix({"loss": f"{results['loss']:.4f}",
+                             "HR@10": f"{results['hit_ratio@10']:.4f}"})
         bar.close()
 
         self.metrics_log.append({
@@ -302,7 +264,7 @@ class FederatedNCF:
             "hit_ratio@10": round(float(np.mean(agg_results["hit_ratio@10"])), 6),
             "ndcg@10":      round(float(np.mean(agg_results["ndcg@10"])),      6),
         })
-        return timings, client_sparse_As, client_shared
+        return timings, client_mlp_As, client_gmf_As, client_shared
 
     # ── Standard evaluation ───────────────────────────────────────────────────
 
@@ -325,7 +287,7 @@ class FederatedNCF:
                   f"ndcg@{k}": round(ndcg_mean, 6),
                   "eval_loss": round(loss_mean, 6), "evaluated_users": total_n}
         self.eval_log.append(record)
-        print(f"\n[SCoLR Eval — Epoch {epoch:>3d}]  "
+        print(f"\n[CoLR Eval — Epoch {epoch:>3d}]  "
               f"HR@{k} = {hr_mean:.4f}  |  NDCG@{k} = {ndcg_mean:.4f}  |  "
               f"Loss = {loss_mean:.4f}  ({total_n} / {self.num_clients} users)\n")
         return record
@@ -337,17 +299,14 @@ class FederatedNCF:
         for t in timings:
             by_bw[t["bandwidth"]].append(t)
         print(f"\n{'='*60}")
-        print(f"Epoch {epoch} Timing  [SCoLR — heterogeneous rank, sparse upload]")
+        print(f"Epoch {epoch} Timing  [CoLR rank={self.rank}, B re-sampled]")
         print(f"{'='*60}")
         for name, ts in by_bw.items():
             if not ts:
                 continue
-            r = ts[0]["rank_u"]
-            su_avg = np.mean([t["su_size"] for t in ts])
-            print(f"  [{name.upper():6s}] rank={r:2d}  n={len(ts):3d}  "
-                  f"avg|S_u|={su_avg:.0f}  "
-                  f"dl={np.mean([t['download_time_s'] for t in ts]):.4f}s  "
-                  f"train={np.mean([t['train_time_s'] for t in ts]):.4f}s  "
+            print(f"  [{name.upper():6s}] n={len(ts):3d} | "
+                  f"dl={np.mean([t['download_time_s'] for t in ts]):.4f}s | "
+                  f"train={np.mean([t['train_time_s'] for t in ts]):.4f}s | "
                   f"ul={np.mean([t['upload_time_s'] for t in ts]):.4f}s")
         bottleneck = max(t["total_time_s"] for t in timings)
         print(f"  [BOTTLENECK] {bottleneck:.4f}s  |  [AGG] {agg_time:.4f}s  |  "
@@ -359,23 +318,30 @@ class FederatedNCF:
     def train(self):
         server_model = ServerNeuralCollaborativeFiltering(
             item_num=self.item_num, predictive_factor=self.latent_dim,
-            rank=self.global_rank).to(self.device)
+            rank=self.rank).to(self.device)
+
+        dl_bits = _download_bits(self.item_num, self.latent_dim, self.rank)
+        ul_bits = _upload_bits(  self.item_num, self.latent_dim, self.rank)
+        print(f"Download : {dl_bits/8/1024:.2f} KB  (dense Q + B + MLP)  |  "
+              f"Upload : {ul_bits/8/1024:.2f} KB  (full A + MLP)\n")
 
         for epoch in range(self.aggregation_epochs):
-            # ── 1. Sample new B(t) ~ D_B  (Algorithm 2, line 2) ──────────────
+            # ── 1. Sample B(t) ~ D_B  (Algorithm 1, line 3) ──────────────────
+            #       Must happen BEFORE broadcasting to clients
             server_model.sample_new_B()
 
-            # ── 2. Local training on each client ──────────────────────────────
-            timings, client_sparse_As, client_shared = \
-                self._single_round(epoch, server_model)
+            # ── 2. Broadcast Q(t) + B(t) + MLP; local training; collect A ────
+            timings, client_mlp_As, client_gmf_As, client_shared = \
+                self._single_round(epoch, server_model, dl_bits, ul_bits)
 
-            # ── 3. Aggregate sparse deltas + merge into dense Q ───────────────
-            #      Algorithm 2, line 16 + next-round merge (line 5)
+            # ── 3. Aggregate A + merge Q (Algorithm 1, lines 18 + 7) ──────────
+            #       Q(t+1) = Q(t) + B(t) @ A(t+1).T
             t0 = time.time()
             server_model.aggregate_and_merge(
-                client_sparse_As = client_sparse_As,
-                client_n_items   = self.client_n_items,
-                client_shared    = client_shared,
+                client_mlp_As  = client_mlp_As,
+                client_gmf_As  = client_gmf_As,
+                client_n_items = self.client_n_items,
+                client_shared  = client_shared,
             )
             agg_time = time.time() - t0
 
@@ -421,13 +387,6 @@ class FederatedNCF:
             print(f"Final HR@10   : {last['hr@10']:.6f}")
             print(f"Final NDCG@10 : {last['ndcg@10']:.6f}")
 
-        # Rank distribution summary
-        print(f"\n-- Rank distribution --")
-        for bw in ["slow", "medium", "fast"]:
-            cnt = self.bandwidth_profiles.count(bw)
-            r   = get_client_rank(bw, self.global_rank)
-            print(f"  {bw:6s}  n={cnt:3d}  rank={r}")
-
         if self.timing_log:
             rounds = [max(t["total_time_s"] for t in tl["timings"])
                       for tl in self.timing_log]
@@ -457,7 +416,7 @@ if __name__ == "__main__":
         local_epochs       = 2,
         batch_size         = 256,
         latent_dim         = 64,
-        rank               = 16,      # global rank r_g; slow→4, medium→8, fast→16
+        rank               = 16,
         lr                 = 5e-4,
         seed               = 42,
         device             = DEVICE,
