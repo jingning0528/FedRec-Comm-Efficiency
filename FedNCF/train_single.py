@@ -105,13 +105,13 @@ class NCFTrainer:
 
         x_all  = torch.cat([x[pos_mask], x[neg_mask]], dim=0).to(self.device)
         scores = self.ncf(x_all).squeeze(-1)
+        n_pos  = pos_mask.sum().item()
 
-        n_pos      = pos_mask.sum().item()
-        pos_scores = scores[:n_pos]           # (n_pos,)
-        neg_scores = scores[n_pos:]           # (n_neg,)
+        pos_scores = scores[:n_pos]
+        neg_scores = scores[n_pos:]
 
-        # BPR: -mean log σ(s_pos - s_neg) over all (pos, neg) pairs
-        diff     = pos_scores.unsqueeze(1) - neg_scores.unsqueeze(0)   # (n_pos, n_neg)
+        # BPR loss — same as LoRA
+        diff     = pos_scores.unsqueeze(1) - neg_scores.unsqueeze(0)
         bpr_loss = -F.logsigmoid(diff).mean()
 
         bpr_loss.backward()
