@@ -65,40 +65,33 @@ def _upload_bits(item_num: int, latent_dim: int, rank: int) -> int:
     CoLR upload per client (Algorithm 1, line 16):
       - Full A_u (mlp + gmf):  item_num × rank × 2
       - MLP LowRankLinear factors + output heads
-    B is NOT uploaded (server keeps its own B).
     """
     pf   = latent_dim
     bits = 0
-    # Full item A (mlp + gmf) — NOT sparse (that is SCoLR's optimisation)
-    bits += item_num * rank * 2 * 32
-    # MLP 3 layers
+    bits += item_num * rank * 2 * 32          # full A (mlp + gmf)
     mlp_dims = [(4*pf, 2*pf), (2*pf, pf), (pf, pf//2)]
     for (in_f, out_f) in mlp_dims:
         bits += (out_f * rank + in_f * rank + out_f) * 32
-    # output heads
-    bits += (2*pf + pf//2 + pf + 1) * 32
+    bits += (2*pf + pf//2 + pf + 1) * 32     # output heads
     return bits
 
 
 def _download_bits(item_num: int, latent_dim: int, rank: int) -> int:
     """
-    CoLR download per client (Algorithm 1, lines 9-10):
-      - Q dense (mlp + gmf):  item_num × 2*pf × 2
-      - B (mlp + gmf):        2*pf × rank × 2
+    CoLR download per client (Algorithm 1, lines 6 + 10):
+      - A_agg (mlp + gmf):  item_num × rank × 2   ← replaces dense Q download
+      - B(t)  (mlp + gmf):  2*pf × rank × 2
       - MLP + output heads
+    NOTE: dense Q is NOT downloaded — clients maintain Q locally.
     """
     pf   = latent_dim
     bits = 0
-    # Q dense (mlp + gmf)
-    bits += item_num * 2 * pf * 2 * 32
-    # B (mlp + gmf)
-    bits += 2 * pf * rank * 2 * 32
-    # MLP 3 layers
+    bits += item_num * rank * 2 * 32          # A_agg (mlp + gmf) — NOT dense Q
+    bits += 2 * pf * rank * 2 * 32            # B (mlp + gmf)
     mlp_dims = [(4*pf, 2*pf), (2*pf, pf), (pf, pf//2)]
     for (in_f, out_f) in mlp_dims:
         bits += (out_f * rank + in_f * rank + out_f) * 32
-    # output heads
-    bits += (2*pf + pf//2 + pf + 1) * 32
+    bits += (2*pf + pf//2 + pf + 1) * 32     # output heads
     return bits
 
 
@@ -189,7 +182,7 @@ class FederatedNCF:
         print(f"CoLR rank     : {rank}")
         print(f"Upload/client : {ul_bits/8/1024:.2f} KB  "
               f"(full A, saving {saving_ul:.1f}% vs full-rank)")
-        print(f"Download/cl.  : {dl_bits/8/1024:.2f} KB  (dense Q + B + MLP)")
+        print(f"Download/cl.  : {dl_bits/8/1024:.2f} KB  (A_agg + B + MLP, Q local)")
         print(f"Aggregation   : weighted FedAvg on A; merge Q = Q + B @ A.T")
         print(f"B sampling    : re-sampled from N(0, 1/sqrt(r)) EVERY round")
         print(f"Learning rate : {lr}")
@@ -214,6 +207,7 @@ class FederatedNCF:
         client_mlp_As = []
         client_gmf_As = []
         client_shared = []
+        is_first_round = (epoch == 0)
 
         bar = tqdm(enumerate(self.clients), total=self.num_clients,
                    desc=f"Epoch {epoch}")
@@ -221,9 +215,10 @@ class FederatedNCF:
             bw      = BANDWIDTH_PROFILES[self.bandwidth_profiles[cid]]
             dl_time = comm_time(dl_bits, bw["download"])
 
-            # ── Alg 1, lines 9-10: receive Q(t) + B(t), copy to client ───────
+            # ── Alg 1, lines 6-10: merge local Q + download new B + MLP ──────
             client.ncf.to(self.device)
-            client.ncf.load_server_weights(server_model)
+            client.ncf.load_server_weights(server_model,
+                                           is_first_round=is_first_round)
 
             # ── Alg 1, lines 10-11: reset A=0, freeze Q_base + B ─────────────
             client.ncf.prepare_for_local_train()
@@ -233,13 +228,10 @@ class FederatedNCF:
             results    = client.train(self.optimizers[cid])
             train_time = time.time() - t0
 
-            # ── Collect full A_u + shared weights for upload ──────────────────
             a_dict = client.ncf.get_item_A()
             client_mlp_As.append(a_dict["mlp_A"])
             client_gmf_As.append(a_dict["gmf_A"])
             client_shared.append(client.ncf.get_shared_weights())
-
-            # ── Unfreeze for next round's weight loading ──────────────────────
             client.ncf.unfreeze_all()
 
             ul_time = comm_time(ul_bits, bw["upload"])
@@ -322,22 +314,20 @@ class FederatedNCF:
 
         dl_bits = _download_bits(self.item_num, self.latent_dim, self.rank)
         ul_bits = _upload_bits(  self.item_num, self.latent_dim, self.rank)
-        print(f"Download : {dl_bits/8/1024:.2f} KB  (dense Q + B + MLP)  |  "
+        print(f"Download : {dl_bits/8/1024:.2f} KB  (A_agg + B + MLP, Q local)  |  "
               f"Upload : {ul_bits/8/1024:.2f} KB  (full A + MLP)\n")
 
         for epoch in range(self.aggregation_epochs):
-            # ── 1. Sample B(t) ~ D_B  (Algorithm 1, line 3) ──────────────────
-            #       Must happen BEFORE broadcasting to clients
+            # ── 1. Sample B(t) ~ D_B, save B(t-1) as prev ────────────────────
             server_model.sample_new_B()
 
-            # ── 2. Broadcast Q(t) + B(t) + MLP; local training; collect A ────
+            # ── 2. Clients: merge local Q + train; upload A ───────────────────
             timings, client_mlp_As, client_gmf_As, client_shared = \
                 self._single_round(epoch, server_model, dl_bits, ul_bits)
 
-            # ── 3. Aggregate A + merge Q (Algorithm 1, lines 18 + 7) ──────────
-            #       Q(t+1) = Q(t) + B(t) @ A(t+1).T
+            # ── 3. Aggregate A (Algorithm 1, line 18) — no Q merge on server ──
             t0 = time.time()
-            server_model.aggregate_and_merge(
+            server_model.aggregate(
                 client_mlp_As  = client_mlp_As,
                 client_gmf_As  = client_gmf_As,
                 client_n_items = self.client_n_items,
@@ -345,12 +335,10 @@ class FederatedNCF:
             )
             agg_time = time.time() - t0
 
-            # ── 4. Logging ────────────────────────────────────────────────────
             self._print_timing(epoch, timings, agg_time)
             self.timing_log.append({"epoch": epoch,
                                     "timings": timings, "agg_time": agg_time})
 
-            # ── 5. Evaluate ───────────────────────────────────────────────────
             if (epoch + 1) % self.eval_every == 0 or \
                epoch == self.aggregation_epochs - 1:
                 self._evaluate(epoch, k=10, n_neg=99)

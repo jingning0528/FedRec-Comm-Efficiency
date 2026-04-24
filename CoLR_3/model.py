@@ -6,11 +6,11 @@ from .low_rank import CoLREmbedding, LowRankLinear
 class NeuralCollaborativeFiltering(torch.nn.Module):
     """
     CoLR-NCF (Algorithm 1 faithful):
-      - Q_base: dense merged embedding, received from server, frozen on client.
-      - B:      random basis re-sampled each round, frozen on client.
-      - A:      low-rank delta, initialized to 0 each round — ONLY trained param (item-side).
+      - Q_base: maintained LOCALLY on client, never re-downloaded.
+      - Each round: client merges Q = Q + B_prev @ A_downloaded.T  (Alg 1, line 7)
+      - B:  new random basis downloaded each round, frozen on client.
+      - A:  low-rank delta, reset to 0 each round, only trainable item-side param.
       - Upload: full A (all items) each round.
-      - User embeddings: private, never communicated.
     """
 
     def __init__(self, user_num: int, item_num: int,
@@ -20,21 +20,17 @@ class NeuralCollaborativeFiltering(torch.nn.Module):
         self.rank = rank
         self.pf   = pf
 
-        # ── User embeddings (private, never communicated) ─────────────────────
         self.mlp_user_embeddings = torch.nn.Embedding(user_num, 2 * pf)
         self.gmf_user_embeddings = torch.nn.Embedding(user_num, 2 * pf)
 
-        # ── Item embeddings: CoLR (Q_base + A @ B.T) ─────────────────────────
         self.mlp_item_embeddings = CoLREmbedding(item_num, 2 * pf, rank)
         self.gmf_item_embeddings = CoLREmbedding(item_num, 2 * pf, rank)
 
-        # ── MLP tower (shared, averaged via FedAvg) ───────────────────────────
         self.mlp = torch.nn.Sequential(
             LowRankLinear(4 * pf, 2 * pf, rank), torch.nn.ReLU(),
             LowRankLinear(2 * pf, pf,     rank), torch.nn.ReLU(),
             LowRankLinear(pf,     pf // 2, rank), torch.nn.ReLU(),
         )
-
         self.gmf_out        = torch.nn.Linear(2 * pf,  1)
         self.gmf_out.weight = torch.nn.Parameter(torch.ones(1, 2 * pf))
         self.mlp_out        = torch.nn.Linear(pf // 2, 1)
@@ -75,41 +71,27 @@ class NeuralCollaborativeFiltering(torch.nn.Module):
         for s, d in zip(src.parameters(), dst.parameters()):
             d.data[:] = s.data[:]
 
-    # ── Algorithm 1 per-round hooks ───────────────────────────────────────────
-
     def prepare_for_local_train(self):
-        """
-        Called after loading server weights, before local training.
-        Reset A=0 and freeze Q_base + B  (Alg 1, lines 10-11).
-        Only A_u and user embeddings (p_u) are trainable.
-        """
+        """Reset A=0 and freeze Q_base + B (Alg 1, lines 10-11)."""
         self.mlp_item_embeddings.reset_A()
         self.gmf_item_embeddings.reset_A()
         self.mlp_item_embeddings.freeze_for_local_train()
         self.gmf_item_embeddings.freeze_for_local_train()
 
     def unfreeze_all(self):
-        """Restore all parameters to trainable."""
         for p in self.parameters():
             p.requires_grad_(True)
 
-    # kept for backwards compat — delegates to prepare_for_local_train
     def freeze_item_B(self):
         self.prepare_for_local_train()
 
     def get_item_A(self) -> dict:
-        """
-        Extract full A matrices for upload (Alg 1, line 16).
-        Uploads ALL rows (not sparse — that is SCoLR's optimisation).
-        Returns detached CPU tensors.
-        """
         return {
-            "mlp_A": self.mlp_item_embeddings.A.weight.detach().cpu(),  # (item_num, rank)
-            "gmf_A": self.gmf_item_embeddings.A.weight.detach().cpu(),  # (item_num, rank)
+            "mlp_A": self.mlp_item_embeddings.A.weight.detach().cpu(),
+            "gmf_A": self.gmf_item_embeddings.A.weight.detach().cpu(),
         }
 
     def get_shared_weights(self) -> dict:
-        """MLP tower + output heads for FedAvg."""
         return {
             "mlp_state":       {k: v.detach().cpu()
                                 for k, v in self.mlp.state_dict().items()},
@@ -119,19 +101,31 @@ class NeuralCollaborativeFiltering(torch.nn.Module):
             "output_logits_b": self.output_logits.bias.detach().cpu(),
         }
 
-    def load_server_weights(self, server_model):
+    def load_server_weights(self, server_model, is_first_round: bool = False):
         """
-        Load from server before local training (Alg 1, lines 9-10):
-          - Q_base ← merged dense Q from server
-          - B      ← new random basis B(t)
-          - MLP tower + output heads
-        A is reset to 0 by prepare_for_local_train().
-        """
-        # ── Q_base: merged dense embedding Q(t) ──────────────────────────────
-        self.mlp_item_embeddings.Q_base.weight.data.copy_(server_model.Q_mlp.data)
-        self.gmf_item_embeddings.Q_base.weight.data.copy_(server_model.Q_gmf.data)
+        Algorithm 1, lines 5-10:
+          t > 0:  Download A(t), merge Q_u = Q_u + B_prev @ A(t).T  (lines 6-7)
+          All t:  Download B(t), reset A=0                           (line 10)
+          MLP tower + output heads (FedAvg result)
 
-        # ── B: new random basis B(t) ──────────────────────────────────────────
+        Dense Q is NOT downloaded — it lives permanently on the client.
+        """
+        dev = self.mlp_item_embeddings.Q_base.weight.device
+
+        # ── Alg 1, lines 6-7: merge Q locally using downloaded A + prev B ─────
+        if not is_first_round:
+            A_mlp = server_model.A_mlp_agg.to(dev)   # (item_num, rank)
+            A_gmf = server_model.A_gmf_agg.to(dev)
+            B_mlp_prev = server_model.B_mlp_prev.to(dev)  # (2*pf, rank)
+            B_gmf_prev = server_model.B_gmf_prev.to(dev)
+
+            # Q = Q + B_prev @ A.T  →  (item_num, 2*pf)
+            self.mlp_item_embeddings.Q_base.weight.data.add_(
+                (B_mlp_prev @ A_mlp.T).T)
+            self.gmf_item_embeddings.Q_base.weight.data.add_(
+                (B_gmf_prev @ A_gmf.T).T)
+
+        # ── Alg 1, line 10: download new B(t) ────────────────────────────────
         self.mlp_item_embeddings.B.data.copy_(server_model.B_mlp)
         self.gmf_item_embeddings.B.data.copy_(server_model.B_gmf)
 

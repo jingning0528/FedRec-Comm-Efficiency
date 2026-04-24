@@ -9,12 +9,11 @@ class ServerNeuralCollaborativeFiltering(torch.nn.Module):
 
     Per-round protocol:
       1.  Sample B(t) ~ D_B  (new random basis each round)
-      2.  Broadcast Q(t) [dense], B(t), MLP weights to all clients.
-      3.  Clients: copy Q→Q_base, copy B, reset A=0, train {A_u, p_u}.
+      2.  Broadcast A(t+1) [aggregated low-rank], B(t), MLP weights to clients.
+          NOTE: dense Q is NOT broadcast — clients maintain Q locally.
+      3.  Clients: merge Q_u = Q_u + B(t-1) @ A(t), copy new B, reset A=0.
       4.  Clients upload: A_u (full, all items).
       5.  Server aggregates: A(t+1) = Σ (N_u/N) * A_u
-      6.  Server merges:     Q(t+1) = Q(t) + B(t) @ A(t+1).T
-          (ready for next round broadcast)
     """
 
     def __init__(self, item_num: int, predictive_factor: int = 32, rank: int = 16):
@@ -24,18 +23,24 @@ class ServerNeuralCollaborativeFiltering(torch.nn.Module):
         self.item_num = item_num
         self.pf       = pf
 
-        # ── Dense item embeddings Q — merged each round (Alg 1, line 7) ──────
-        self.Q_mlp = torch.nn.Parameter(torch.empty(item_num, 2 * pf))
-        self.Q_gmf = torch.nn.Parameter(torch.empty(item_num, 2 * pf))
-        torch.nn.init.normal_(self.Q_mlp, std=0.01)
-        torch.nn.init.normal_(self.Q_gmf, std=0.01)
+        # ── Aggregated A — broadcast to clients each round (NOT dense Q) ──────
+        # After round t: A(t+1) = Σ (N_u/N) * A_u
+        # Clients use this to merge their local Q: Q = Q + B_prev @ A.T
+        self.register_buffer('A_mlp_agg', torch.zeros(item_num, rank))
+        self.register_buffer('A_gmf_agg', torch.zeros(item_num, rank))
+
+        # ── Previous-round B — needed by clients for merge (Alg 1, line 7) ───
+        # Clients keep B(t-1) locally, but server also tracks it for reference
+        self.register_buffer('B_mlp_prev', torch.empty(2 * pf, rank))
+        self.register_buffer('B_gmf_prev', torch.empty(2 * pf, rank))
 
         # ── Current-round B matrices — re-sampled each round (Alg 1, line 3) ─
-        # Registered as buffers: move with .to(device) but not optimised
         self.register_buffer('B_mlp', torch.empty(2 * pf, rank))
         self.register_buffer('B_gmf', torch.empty(2 * pf, rank))
         self._sample_B_inplace(self.B_mlp)
         self._sample_B_inplace(self.B_gmf)
+        self.B_mlp_prev.copy_(self.B_mlp)
+        self.B_gmf_prev.copy_(self.B_gmf)
 
         # ── Shared MLP tower + output heads ───────────────────────────────────
         self.mlp = torch.nn.Sequential(
@@ -63,9 +68,11 @@ class ServerNeuralCollaborativeFiltering(torch.nn.Module):
 
     def sample_new_B(self):
         """
-        Algorithm 1, line 3: sample B(t) ~ D_B (called once per round,
-        BEFORE broadcasting to clients).
+        Algorithm 1, line 3: sample B(t) ~ D_B.
+        Save current B as B_prev (clients need B(t-1) for merge).
         """
+        self.B_mlp_prev.copy_(self.B_mlp)
+        self.B_gmf_prev.copy_(self.B_gmf)
         self._sample_B_inplace(self.B_mlp)
         self._sample_B_inplace(self.B_gmf)
 
@@ -77,42 +84,36 @@ class ServerNeuralCollaborativeFiltering(torch.nn.Module):
 
     # ── Aggregation + merge (Algorithm 1, lines 18 + 7) ──────────────────────
 
-    def aggregate_and_merge(self,
-                            client_mlp_As: list,   # list of (item_num, rank) tensors
-                            client_gmf_As: list,
-                            client_n_items: list,  # N_u per client
-                            client_shared:  list,  # MLP + output head weight dicts
-                            ):
+    def aggregate(self,
+                  client_mlp_As: list,
+                  client_gmf_As: list,
+                  client_n_items: list,
+                  client_shared:  list):
         """
-        Algorithm 1, lines 18 (aggregate) and 7 (merge):
+        Algorithm 1, line 18: aggregate A only.
+          A(t+1) = Σ_u (N_u/N) * A_u(t)
 
-          A(t+1)  = Σ_u (N_u/N) * A_u(t)          ← weighted FedAvg on A
-          Q(t+1)  = Q(t) + B(t) @ A(t+1).T         ← merge delta into dense Q
-
-        B(t) used here is the CURRENT round's B (same B clients trained with).
-        After merge, Q(t+1) is ready to broadcast next round.
+        Dense Q merge now happens on CLIENT side (Alg 1, line 7).
         Also averages MLP tower + output heads (standard FedAvg).
         """
         total_n = sum(client_n_items)
-        dev     = self.Q_mlp.device
+        dev     = self.A_mlp_agg.device
 
         # ── Aggregate A: weighted FedAvg (Alg 1, line 18) ────────────────────
-        A_mlp_agg = torch.zeros(self.item_num, self.rank, device=dev)
-        A_gmf_agg = torch.zeros(self.item_num, self.rank, device=dev)
+        A_mlp_new = torch.zeros(self.item_num, self.rank, device=dev)
+        A_gmf_new = torch.zeros(self.item_num, self.rank, device=dev)
 
         for mlp_A, gmf_A, n in zip(client_mlp_As, client_gmf_As, client_n_items):
             w = n / total_n
-            A_mlp_agg += w * mlp_A.to(dev)
-            A_gmf_agg += w * gmf_A.to(dev)
+            A_mlp_new += w * mlp_A.to(dev)
+            A_gmf_new += w * gmf_A.to(dev)
 
-        # ── Merge: Q(t+1) = Q(t) + B(t) @ A(t+1).T  (Alg 1, line 7) ────────
-        # B_mlp : (2*pf, rank),  A_mlp_agg : (item_num, rank)
-        # B @ A.T → (2*pf, item_num) → .T → (item_num, 2*pf)
-        self.Q_mlp.data.add_((self.B_mlp @ A_mlp_agg.T).T)
-        self.Q_gmf.data.add_((self.B_gmf @ A_gmf_agg.T).T)
+        # Store aggregated A for broadcast to clients next round
+        self.A_mlp_agg.copy_(A_mlp_new)
+        self.A_gmf_agg.copy_(A_gmf_new)
 
         # ── FedAvg on MLP tower + output heads ────────────────────────────────
-        num = len(client_shared)
+        num     = len(client_shared)
         avg_mlp = {k: torch.zeros_like(v)
                    for k, v in client_shared[0]["mlp_state"].items()}
         for cs in client_shared:
