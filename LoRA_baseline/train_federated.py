@@ -159,6 +159,7 @@ class FederatedNCF:
         self.lora_rank          = lora_rank
         self.lr                 = lr
         self.item_num           = train_matrix.shape[1]
+        self.warmup_epochs      = warmup_epochs   # ← add this line
 
         for p in ["./models/local_items/", "./models/local/", "./models/central/"]:
             os.makedirs(p, exist_ok=True)
