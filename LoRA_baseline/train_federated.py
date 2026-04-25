@@ -88,6 +88,21 @@ def federate(utils):
     return time.time() - t0
 
 
+def federate_warmup(utils: Utils) -> float:
+    """FedAvg for warm-up round (averages E0 + MLP + output heads)."""
+    updates = [torch.load(f"./models/local_items/warmup_dp{i}.pt")
+               for i in range(utils.num_clients)]
+    if not updates:
+        utils.epoch += 1
+        return 0.0
+    t0 = time.time()
+    n  = len(updates)
+    new_state = {k: sum(u[k] for u in updates) / n for k in updates[0]}
+    utils.epoch += 1
+    torch.save(new_state, f"./models/central/server{utils.epoch}.pt")
+    return time.time() - t0
+
+
 class TeeLogger:
     def __init__(self, log_path: str):
         self._terminal = sys.stdout
@@ -120,7 +135,8 @@ class FederatedNCF:
                  seed:               int   = 0,
                  device:             str   = None,
                  eval_fraction:      float = 0.2,
-                 eval_every:         int   = 5):
+                 eval_every:         int   = 5,
+                 warmup_epochs: int = 5):
 
         random.seed(seed)
         np.random.seed(seed)
@@ -311,6 +327,59 @@ class FederatedNCF:
               f"({self.cumulative_time/60:.2f} min) over {epoch+1} rounds")
         print(f"{'='*60}")
 
+    def _warmup_single_round(self, epoch: int, payload_size_bits: int) -> list:
+        """One warm-up round: full item embs + MLP trained."""
+        timings     = []
+        agg_results = {"loss": [], "hit_ratio@10": [], "ndcg@10": []}
+        bar = tqdm(enumerate(self.clients), total=self.num_clients,
+                   desc=f"Warmup {epoch}")
+        for cid, client in bar:
+            bw         = BANDWIDTH_PROFILES[self.bandwidth_profiles[cid]]
+            dl_time    = calc_comm_time(payload_size_bits, bw["download"])
+            t0         = time.time()
+            results    = client.train(self.optimizers[cid])
+            train_time = time.time() - t0
+            ul_time    = calc_comm_time(payload_size_bits, bw["upload"])
+            timings.append({
+                "client_id": cid, "bandwidth": self.bandwidth_profiles[cid],
+                "download_time_s": round(dl_time, 4),
+                "train_time_s":    round(train_time, 4),
+                "upload_time_s":   round(ul_time, 4),
+                "total_time_s":    round(dl_time + train_time + ul_time, 4),
+            })
+            for key in ["loss", "hit_ratio@10", "ndcg@10"]:
+                agg_results[key].append(results[key])
+            torch.save(client.ncf.get_warmup_update(),
+                       f"./models/local_items/warmup_dp{cid}.pt")
+            client.ncf.to(self.device)
+            bar.set_postfix({"loss": f"{results['loss']:.4f}"})
+        bar.close()
+        self.metrics_log.append({
+            "epoch": epoch,
+            "loss":         round(float(np.mean(agg_results["loss"])),         6),
+            "hit_ratio@10": round(float(np.mean(agg_results["hit_ratio@10"])), 6),
+            "ndcg@10":      round(float(np.mean(agg_results["ndcg@10"])),      6),
+        })
+        return timings
+
+    def _transition_to_peft(self, warmup_server_state: dict):
+        """
+        Load aggregated E0 + MLP into every client, reset LoRA to zero-delta,
+        then switch all clients to PEFT mode.
+        """
+        print("\n[Transition] Warm-up → PEFT  "
+              "(freezing E0 & MLP, resetting LoRA adapters)\n")
+        for client in self.clients:
+            client.ncf.load_server_weights(warmup_server_state)
+            client.ncf.reset_lora()
+            client.ncf.set_peft_mode()
+        # Reset optimizers to track only PEFT params
+        self.optimizers = [
+            torch.optim.Adam(
+                filter(lambda p: p.requires_grad, c.ncf.parameters()), lr=self.lr
+            ) for c in self.clients
+        ]
+
     def train(self):
         item_num = self.item_num
         emb_dim  = 2 * self.latent_dim
@@ -322,21 +391,48 @@ class FederatedNCF:
 
         shared_params = sum(
             p.numel() for name, p in server_model.named_parameters()
-            if "lora" not in name
+            if "lora" not in name and "E0" not in name
         )
-        payload_size_bits = get_lora_payload_size_bits(
+        warmup_payload_bits = get_full_model_size_bits(item_num, emb_dim, shared_params)
+        peft_payload_bits   = get_lora_payload_size_bits(
             self.lora_rank, item_num, emb_dim, shared_params)
-        full_size_bits    = get_full_model_size_bits(item_num, emb_dim, shared_params)
+        full_size_bits      = get_full_model_size_bits(item_num, emb_dim, shared_params)
 
         print(f"\n{'='*60}")
-        print(f"Standard LoRA FedAvg  [rank={self.lora_rank}]")
-        print(f"  Full item emb : {full_size_bits/8/1024:.2f} KB")
-        print(f"  LoRA payload  : {payload_size_bits/8/1024:.2f} KB "
-              f"({100*payload_size_bits/full_size_bits:.1f}%)")
+        print(f"Two-phase LoRA FedAvg  [warmup={self.warmup_epochs} | rank={self.lora_rank}]")
+        print(f"  Warm-up payload : {warmup_payload_bits/8/1024:.2f} KB")
+        print(f"  PEFT payload    : {peft_payload_bits/8/1024:.2f} KB  "
+              f"({100*peft_payload_bits/full_size_bits:.1f}% of full)")
         print(f"{'='*60}\n")
 
-        for epoch in range(self.aggregation_epochs):
-            # 1. Distribute server state to all clients
+        # ── Phase 1: Warm-up ──────────────────────────────────────────────────
+        for epoch in range(self.warmup_epochs):
+            warmup_state = torch.load(f"./models/central/server{epoch}.pt")
+            for cid, client in enumerate(self.clients):
+                client.ncf.to(self.device)
+                client.ncf.load_server_weights(warmup_state)
+                client.set_warmup_mode()
+
+            # Reset optimizers to warm-up trainable params
+            self.optimizers = [
+                torch.optim.Adam(
+                    filter(lambda p: p.requires_grad, c.ncf.parameters()), lr=self.lr
+                ) for c in self.clients
+            ]
+
+            timings  = self._warmup_single_round(epoch, warmup_payload_bits)
+            agg_time = federate_warmup(self.utils)
+            self._print_timing(epoch, timings, agg_time,
+                               warmup_payload_bits, full_size_bits)
+
+        # ── Transition ────────────────────────────────────────────────────────
+        final_warmup_state = torch.load(
+            f"./models/central/server{self.warmup_epochs}.pt")
+        self._transition_to_peft(final_warmup_state)
+
+        # ── Phase 2: PEFT ─────────────────────────────────────────────────────
+        for epoch in range(self.warmup_epochs, self.warmup_epochs + self.aggregation_epochs):
+            # Distribute LoRA + MLP payload to clients
             server_model = ServerNeuralCollaborativeFiltering(
                 item_num=item_num, predictive_factor=self.latent_dim,
                 lora_rank=self.lora_rank)
@@ -345,25 +441,28 @@ class FederatedNCF:
             server_model.eval()
 
             download_payload = server_model.get_download_payload()
-            for client in self.clients:
+            for cid, client in enumerate(self.clients):
                 client.ncf.to(self.device)
+                # Only update LoRA + MLP keys; keep client's own E0 frozen
+                lora_mlp_payload = {k: v for k, v in download_payload.items()
+                                    if "lora" in k or k.split(".")[0] in
+                                    {"mlp", "gmf_out", "mlp_out", "output_logits"}}
                 client.ncf.load_server_weights(
-                    {k: v.to(self.device) for k, v in download_payload.items()})
+                    {k: v.to(self.device) for k, v in lora_mlp_payload.items()})
+                self.optimizers[cid] = torch.optim.Adam(
+                    filter(lambda p: p.requires_grad, client.ncf.parameters()), lr=self.lr
+                )
 
-            # 2. Local training (only LoRA + user embs updated)
-            timings = self._single_round(epoch, payload_size_bits)
-
-            # 3. FedAvg on LoRA adapters + shared layers
+            timings  = self._single_round(epoch, peft_payload_bits)
             agg_time = federate(self.utils)
-
-            # 4. Timing summary
             self._print_timing(epoch, timings, agg_time,
-                               payload_size_bits, full_size_bits)
+                               peft_payload_bits, full_size_bits)
             self.timing_log.append({"epoch": epoch, "timings": timings,
                                     "agg_time": agg_time})
 
-            # 5. Evaluate
-            if (epoch + 1) % self.eval_every == 0 or epoch == self.aggregation_epochs - 1:
+            rel_epoch = epoch - self.warmup_epochs
+            total     = self.aggregation_epochs
+            if (rel_epoch + 1) % self.eval_every == 0 or rel_epoch == total - 1:
                 self._evaluate(epoch, k=10, n_neg=99)
 
         self._final_summary()
@@ -425,5 +524,6 @@ if __name__ == "__main__":
         device             = DEVICE,
         eval_fraction      = 0.2,
         eval_every         = 5,
+        warmup_epochs      = 5,
     )
     fncf.train()

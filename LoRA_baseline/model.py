@@ -21,16 +21,13 @@ class NeuralCollaborativeFiltering(nn.Module):
         super().__init__()
         emb_dim = 2 * predictive_factor
 
-        # ── User embeddings (private, fully trained) ──────────────────────────
         self.mlp_user_embeddings = nn.Embedding(user_num, emb_dim)
         self.gmf_user_embeddings = nn.Embedding(user_num, emb_dim)
 
-        # ── Item embeddings: frozen base + LoRA adapters ──────────────────────
-        self.register_buffer("mlp_item_E0", torch.zeros(item_num, emb_dim))
-        self.register_buffer("gmf_item_E0", torch.zeros(item_num, emb_dim))
+        # E0: trainable during warm-up, frozen during PEFT
+        self.mlp_item_E0 = nn.Parameter(torch.zeros(item_num, emb_dim), requires_grad=False)
+        self.gmf_item_E0 = nn.Parameter(torch.zeros(item_num, emb_dim), requires_grad=False)
 
-        # lora_A: shared across all items (rank × emb_dim)
-        # lora_B: per-item factor       (item_num × rank)
         self.mlp_lora_A = nn.Parameter(torch.empty(lora_rank, emb_dim))
         self.mlp_lora_B = nn.Parameter(torch.zeros(item_num, lora_rank))
         self.gmf_lora_A = nn.Parameter(torch.empty(lora_rank, emb_dim))
@@ -101,28 +98,54 @@ class NeuralCollaborativeFiltering(nn.Module):
                              self._mlp_item_emb(item_id)], dim=1)
         return self.mlp(concat)
 
-    # ── LoRA payload helpers ───────────────────────────────────────────────────
+    # ── Phase control ──────────────────────────────────────────────────────────
+
+    def set_warmup_mode(self):
+        """Warm-up: train E0 + user embs + MLP. Freeze LoRA."""
+        _warmup_roots = {"mlp_item_E0", "gmf_item_E0",
+                         "mlp_user_embeddings", "gmf_user_embeddings",
+                         "mlp", "gmf_out", "mlp_out", "output_logits"}
+        for name, p in self.named_parameters():
+            p.requires_grad = name.split(".")[0] in _warmup_roots
+
+    def set_peft_mode(self):
+        """PEFT: train LoRA + user embs. Freeze E0 + MLP."""
+        _peft_roots = {"mlp_lora_A", "mlp_lora_B", "gmf_lora_A", "gmf_lora_B",
+                       "mlp_user_embeddings", "gmf_user_embeddings"}
+        for name, p in self.named_parameters():
+            p.requires_grad = name.split(".")[0] in _peft_roots
+
+    def reset_lora(self):
+        """Re-initialise LoRA to zero-delta state (called at warm-up → PEFT transition)."""
+        nn.init.normal_(self.mlp_lora_A, std=0.01)
+        nn.init.zeros_(self.mlp_lora_B)
+        nn.init.normal_(self.gmf_lora_A, std=0.01)
+        nn.init.zeros_(self.gmf_lora_B)
+
+    # ── Upload payload helpers ─────────────────────────────────────────────────
+
+    def get_warmup_update(self) -> dict:
+        """Warm-up upload: E0 + MLP + output heads (no user embs, no LoRA)."""
+        skip = {"mlp_user_embeddings", "gmf_user_embeddings",
+                "mlp_lora_A", "mlp_lora_B", "gmf_lora_A", "gmf_lora_B"}
+        return {name: p.detach().cpu().clone()
+                for name, p in self.named_parameters()
+                if name.split(".")[0] not in skip}
 
     def get_lora_update(self) -> dict:
-        """Return trainable LoRA params + shared MLP/output layers (no user embs)."""
-        state = {}
-        lora_keys = {"mlp_lora_A", "mlp_lora_B", "gmf_lora_A", "gmf_lora_B"}
-        skip_keys = {"mlp_user_embeddings", "gmf_user_embeddings",
-                     "mlp_item_E0", "gmf_item_E0"}
-        for name, param in self.named_parameters():
-            root = name.split(".")[0]
-            if root not in skip_keys:
-                state[name] = param.detach().cpu().clone()
-        # also include buffers that are LoRA-related keys explicitly
-        return state
+        """PEFT upload: LoRA adapters + shared MLP/output (no user embs, no E0)."""
+        skip = {"mlp_user_embeddings", "gmf_user_embeddings",
+                "mlp_item_E0", "gmf_item_E0"}
+        return {name: p.detach().cpu().clone()
+                for name, p in self.named_parameters()
+                if name.split(".")[0] not in skip}
 
     def load_server_weights(self, payload: dict):
-        """Load aggregated LoRA adapters + shared layers from server."""
+        """Load any payload (warmup or PEFT) from server — skips missing keys."""
         own = self.state_dict()
         for k, v in payload.items():
             if k in own:
                 own[k].copy_(v)
-        # keep user embeddings and E0 buffers unchanged
         self.load_state_dict(own, strict=False)
 
 

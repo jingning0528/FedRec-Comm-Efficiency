@@ -91,12 +91,12 @@ class NCFTrainer:
         }
 
     def _set_trainable(self):
-        """Only LoRA adapters + user embeddings are updated locally."""
         for name, param in self.ncf.named_parameters():
             root = name.split(".")[0]
             param.requires_grad = (
                 name in self._lora_param_names or
-                root in {"mlp_user_embeddings", "gmf_user_embeddings"}
+                root in {"mlp_user_embeddings", "gmf_user_embeddings",
+                         "mlp", "gmf_out", "mlp_out", "output_logits"}  # allow MLP to train
             )
 
     def _reset_loader(self):
@@ -184,6 +184,12 @@ class NCFTrainer:
             "eval_loss":       float(np.mean(losses)),
             "evaluated_users": len(hrs),
         }
+
+    def set_warmup_mode(self):
+        self.ncf.set_warmup_mode()
+
+    def set_peft_mode(self):
+        self.ncf.set_peft_mode()
 
     def train(self, optimizer, return_progress: bool = False):
         self.ncf.join_output_weights()
