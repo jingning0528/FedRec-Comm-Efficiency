@@ -131,7 +131,8 @@ class NCFTrainer:
     # ── Training loop ─────────────────────────────────────────────────────────
 
     def train_model(self, optimizer, epochs=None):
-        self._set_trainable()
+        # Phase already set externally via set_warmup_mode() / set_peft_mode()
+        # Do NOT call _set_trainable() here — it would override phase control
         epochs   = epochs or self.epochs
         progress = {"epoch": [], "loss": [], "hit_ratio@10": [], "ndcg@10": []}
 

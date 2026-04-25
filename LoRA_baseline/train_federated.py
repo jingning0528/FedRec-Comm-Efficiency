@@ -34,9 +34,9 @@ def assign_bandwidth(num_clients, seed=0):
 
 
 def get_lora_payload_size_bits(lora_rank, item_num, emb_dim, shared_params):
-    """Standard LoRA payload: lora_A (rank×d) + lora_B (N×rank) per embedding pair."""
+    """Pure LoRA payload: lora_A (rank×d) + lora_B (N×rank) per embedding pair."""
     lora_params = 2 * (lora_rank * emb_dim + item_num * lora_rank)   # mlp + gmf
-    return (lora_params + shared_params) * 32
+    return lora_params * 32   # no shared_params — MLP is frozen after warmup
 
 
 def get_full_model_size_bits(item_num, emb_dim, shared_params):
@@ -62,7 +62,7 @@ class Utils:
 
 
 def federate(utils):
-    """Standard FedAvg on LoRA adapters (A, B) and shared MLP/output layers."""
+    """Standard FedAvg on LoRA adapters (A, B) only — MLP/output frozen after warmup."""
     updates = utils.get_lora_updates()
     if not updates:
         utils.epoch += 1
@@ -443,12 +443,10 @@ class FederatedNCF:
             download_payload = server_model.get_download_payload()
             for cid, client in enumerate(self.clients):
                 client.ncf.to(self.device)
-                # Only update LoRA + MLP keys; keep client's own E0 frozen
-                lora_mlp_payload = {k: v for k, v in download_payload.items()
-                                    if "lora" in k or k.split(".")[0] in
-                                    {"mlp", "gmf_out", "mlp_out", "output_logits"}}
+                # Only push LoRA keys; MLP/output/E0 stay frozen from transition
+                lora_payload = {k: v for k, v in download_payload.items() if "lora" in k}
                 client.ncf.load_server_weights(
-                    {k: v.to(self.device) for k, v in lora_mlp_payload.items()})
+                    {k: v.to(self.device) for k, v in lora_payload.items()})
                 self.optimizers[cid] = torch.optim.Adam(
                     filter(lambda p: p.requires_grad, client.ncf.parameters()), lr=self.lr
                 )

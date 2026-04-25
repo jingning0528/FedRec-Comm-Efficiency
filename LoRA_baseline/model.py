@@ -133,12 +133,13 @@ class NeuralCollaborativeFiltering(nn.Module):
                 if name.split(".")[0] not in skip}
 
     def get_lora_update(self) -> dict:
-        """PEFT upload: LoRA adapters + shared MLP/output (no user embs, no E0)."""
-        skip = {"mlp_user_embeddings", "gmf_user_embeddings",
-                "mlp_item_E0", "gmf_item_E0"}
-        return {name: p.detach().cpu().clone()
-                for name, p in self.named_parameters()
-                if name.split(".")[0] not in skip}
+        """PEFT upload: LoRA adapters ONLY (no user embs, no E0, no MLP)."""
+        keep = {"mlp_lora_A", "mlp_lora_B", "gmf_lora_A", "gmf_lora_B"}
+        return {
+            name: p.detach().cpu().clone()
+            for name, p in self.named_parameters()
+            if name.split(".")[0] in keep
+        }
 
     def load_server_weights(self, payload: dict):
         """Load any payload (warmup or PEFT) from server — skips missing keys."""
