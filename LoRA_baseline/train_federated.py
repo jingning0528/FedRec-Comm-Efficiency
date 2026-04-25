@@ -427,8 +427,23 @@ class FederatedNCF:
                                warmup_payload_bits, full_size_bits)
 
         # ── Transition ────────────────────────────────────────────────────────
+        # Merge warmup state (E0 + MLP) into a fresh server model that already
+        # holds initialised LoRA keys, then save as the PEFT starting checkpoint.
         final_warmup_state = torch.load(
             f"./models/central/server{self.warmup_epochs}.pt")
+
+        peft_start_model = ServerNeuralCollaborativeFiltering(
+            item_num=item_num, predictive_factor=self.latent_dim,
+            lora_rank=self.lora_rank)
+        # Overlay warmup keys (E0 + MLP); LoRA keys stay at their init values
+        merged = peft_start_model.state_dict()
+        for k, v in final_warmup_state.items():
+            if k in merged:
+                merged[k] = v
+        peft_start_model.load_state_dict(merged)
+        torch.save(peft_start_model.state_dict(),
+                   f"./models/central/server{self.warmup_epochs}.pt")
+
         self._transition_to_peft(final_warmup_state)
 
         # ── Phase 2: PEFT ─────────────────────────────────────────────────────
