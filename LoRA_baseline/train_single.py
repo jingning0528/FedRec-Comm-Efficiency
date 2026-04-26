@@ -193,7 +193,7 @@ class NCFTrainer:
         self.ncf.set_peft_mode()
 
     def train(self, optimizer, return_progress: bool = False):
-        self.ncf.join_output_weights()
+        # removed join_output_weights() — already called once at model init
         results, progress = self.train_model(optimizer)
         return (results, progress) if return_progress else results
 

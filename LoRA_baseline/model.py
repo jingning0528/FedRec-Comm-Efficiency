@@ -45,7 +45,7 @@ class NeuralCollaborativeFiltering(nn.Module):
         self.model_blending = 0.5
 
         self._initialize_weights()
-        self.join_output_weights()
+        self.join_output_weights()   # ← keep here only
 
     # ── Init ──────────────────────────────────────────────────────────────────
 
