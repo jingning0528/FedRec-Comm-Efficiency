@@ -12,16 +12,17 @@ from .server_model import ServerNeuralCollaborativeFiltering
 from dataloader import MovielensDatasetLoader
 
 BANDWIDTH_PROFILES = {
-    "slow":   {"upload": 100, "download": 100},
-    "medium": {"upload": 100, "download": 100},
-    "fast":   {"upload": 100, "download": 100},
+    "slow":   {"upload": 2,   "download": 4},
+    "medium": {"upload": 10,  "download": 20},
+    "fast":   {"upload": 50,  "download": 100},
 }
 
-# BANDWIDTH_PROFILES = {
-#     "slow":   {"upload": 2,   "download": 4},
-#     "medium": {"upload": 10,  "download": 20},
-#     "fast":   {"upload": 50,  "download": 100},
-# }
+# Adaptive rank per bandwidth tier
+RANK_BY_BANDWIDTH = {
+    "slow":   2,
+    "medium": 4,
+    "fast":   8,   # = max_rank
+}
 
 
 def assign_bandwidth(num_clients, seed=0):
@@ -33,15 +34,13 @@ def assign_bandwidth(num_clients, seed=0):
     return out
 
 
-def get_lora_payload_size_bits(lora_rank, item_num, emb_dim, shared_params):
-    """Pure LoRA payload: lora_A (rank×d) + lora_B (N×rank) per embedding pair."""
-    lora_params = 2 * (lora_rank * emb_dim + item_num * lora_rank)   # mlp + gmf
-    return lora_params * 32   # no shared_params — MLP is frozen after warmup
+def get_adaptive_lora_payload_bits(rank, item_num, emb_dim):
+    """LoRA-only payload for a given rank."""
+    return 2 * (rank * emb_dim + item_num * rank) * 32   # mlp + gmf
 
 
 def get_full_model_size_bits(item_num, emb_dim, shared_params):
-    full_item_params = 2 * (item_num * emb_dim)                       # mlp + gmf
-    return (full_item_params + shared_params) * 32
+    return (2 * item_num * emb_dim + shared_params) * 32
 
 
 def calc_comm_time(size_bits, bandwidth_mbps):
@@ -61,8 +60,13 @@ class Utils:
                 for i in range(self.num_clients)]
 
 
-def federate(utils):
-    """Standard FedAvg on LoRA adapters (A, B) only — MLP/output frozen after warmup."""
+def federate_adaptive(utils, rank_by_client: list, max_rank: int) -> float:
+    """
+    FedAvg with zero-padding for heterogeneous ranks.
+
+    Each rank-slice [0:r] is averaged only over clients whose rank >= r,
+    so higher-rank clients do not dilute lower-rank slots with zeros.
+    """
     updates = utils.get_lora_updates()
     if not updates:
         utils.epoch += 1
@@ -70,19 +74,37 @@ def federate(utils):
 
     prev_state = torch.load(f"./models/central/server{utils.epoch}.pt")
     utils.epoch += 1
+    t0 = time.time()
 
-    t0          = time.time()
-    updates_cpu = [{k: v.cpu() for k, v in u.items()} for u in updates]
-    n           = len(updates_cpu)
+    new_state = {k: v.clone() for k, v in prev_state.items()}
 
-    new_state = {}
-    for k in updates_cpu[0]:
-        new_state[k] = sum(u[k] for u in updates_cpu) / n
+    lora_A_keys = {"mlp_lora_A", "gmf_lora_A"}
+    lora_B_keys = {"mlp_lora_B", "gmf_lora_B"}
 
-    # Carry over buffers (E0) and any keys not in the upload payload
-    for k in prev_state:
-        if k not in new_state:
-            new_state[k] = prev_state[k]
+    for key in lora_A_keys | lora_B_keys:
+        is_A    = key in lora_A_keys
+        ref     = prev_state[key]                          # (max_rank, d) or (N, max_rank)
+        acc     = torch.zeros_like(ref)                    # accumulator
+        counts  = torch.zeros(max_rank)                    # per-rank-slice count
+
+        for i, upd in enumerate(updates):
+            r   = rank_by_client[i]
+            val = upd[key].cpu()                           # (r, d) or (N, r)
+            if is_A:
+                acc[:r] += val
+            else:
+                acc[:, :r] += val
+            counts[:r] += 1
+
+        # Normalise each rank slice by its contributor count
+        for r_idx in range(max_rank):
+            if counts[r_idx] > 0:
+                if is_A:
+                    acc[r_idx] /= counts[r_idx]
+                else:
+                    acc[:, r_idx] /= counts[r_idx]
+
+        new_state[key] = acc
 
     torch.save(new_state, f"./models/central/server{utils.epoch}.pt")
     return time.time() - t0
@@ -95,8 +117,8 @@ def federate_warmup(utils: Utils) -> float:
     if not updates:
         utils.epoch += 1
         return 0.0
-    t0 = time.time()
-    n  = len(updates)
+    t0        = time.time()
+    n         = len(updates)
     new_state = {k: sum(u[k] for u in updates) / n for k in updates[0]}
     utils.epoch += 1
     torch.save(new_state, f"./models/central/server{utils.epoch}.pt")
@@ -130,104 +152,136 @@ class FederatedNCF:
                  local_epochs:       int   = 2,
                  batch_size:         int   = 256,
                  latent_dim:         int   = 64,
-                 lora_rank:          int   = 8,
+                 lora_rank:          int   = 8,    # = max_rank for fast clients
                  lr:                 float = 5e-4,
                  seed:               int   = 0,
                  device:             str   = None,
                  eval_fraction:      float = 0.2,
                  eval_every:         int   = 5,
-                 warmup_epochs:      int   = 5,
-                 save_log:           bool  = True):   # ← new
+                 warmup_epochs:      int   = 5):
 
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
+        random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
 
         if device is not None:
             self.device = torch.device(device)
         else:
             self.device = torch.device(
                 "cuda" if torch.cuda.is_available() else
-                "mps"  if torch.backends.mps.is_available() else
-                "cpu"
-            )
+                "mps"  if torch.backends.mps.is_available() else "cpu")
 
         self.num_clients        = num_clients
         self.aggregation_epochs = aggregation_epochs
         self.local_epochs       = local_epochs
         self.batch_size         = batch_size
         self.latent_dim         = latent_dim
-        self.lora_rank          = lora_rank
+        self.lora_rank          = lora_rank          # max rank
         self.lr                 = lr
         self.item_num           = train_matrix.shape[1]
-        self.warmup_epochs      = warmup_epochs   # ← add this line
-        self.save_log = save_log
+        self.warmup_epochs      = warmup_epochs
+
+        for p in ["./models/local_items/", "./models/local/", "./models/central/"]:
+            os.makedirs(p, exist_ok=True)
+
+        self.bandwidth_profiles = assign_bandwidth(num_clients, seed=seed)
+        # Per-client rank based on bandwidth tier
+        self.client_ranks = [RANK_BY_BANDWIDTH[bw] for bw in self.bandwidth_profiles]
+
+        self.metrics_log = []; self.eval_log = []; self.timing_log = []
+        self.utils       = Utils(num_clients)
+
+        self.cumulative_time          = 0.0
+        self.cumulative_download_time = 0.0
+        self.cumulative_train_time    = 0.0
+        self.cumulative_upload_time   = 0.0
+        self.cumulative_agg_time      = 0.0
+
+        self.eval_every      = eval_every
+        rng                  = np.random.default_rng(seed)
+        n_eval               = max(1, int(num_clients * eval_fraction))
+        self.eval_client_ids = rng.choice(num_clients, size=n_eval, replace=False).tolist()
+
+        assert train_matrix.shape[0] == num_clients
+
+        # Each client gets its tier-specific rank
+        self.clients = [
+            NCFTrainer(train_matrix[i:i+1], epochs=local_epochs,
+                       batch_size=batch_size, latent_dim=latent_dim,
+                       lora_rank=self.client_ranks[i],   # ← adaptive rank
+                       device=self.device, global_user_offset=i)
+            for i in range(num_clients)
+        ]
+        self.optimizers = [
+            torch.optim.Adam(
+                filter(lambda p: p.requires_grad, c.ncf.parameters()), lr=lr
+            ) for c in self.clients
+        ]
 
         root      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         log_dir   = os.path.join(root, "result_figure")
         folder    = os.path.basename(os.path.dirname(os.path.abspath(__file__)))
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         self.log_path = os.path.join(log_dir, f"{folder}-{timestamp}.txt")
+        self.logger   = TeeLogger(self.log_path)
+        sys.stdout    = self.logger
 
-        if self.save_log:
-            self.logger = TeeLogger(self.log_path)
-            sys.stdout  = self.logger
-        else:
-            self.logger   = None
-            self.log_path = None
-
+        rank_counts = {bw: self.bandwidth_profiles.count(bw) for bw in RANK_BY_BANDWIDTH}
         print(f"Log file : {self.log_path}")
         print(f"Started  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Device   : {self.device}")
         print(f"{'='*60}")
         print(f"Dataset       : ML-1M  |  Items: {self.item_num}")
         print(f"Users         : {num_clients}")
-        print(f"Method        : Standard LoRA FedAvg")
+        print(f"Method        : Adaptive LoRA FedAvg")
         print(f"Local epochs  : {local_epochs}")
         print(f"Batch size    : {batch_size}")
         print(f"Latent dim    : {latent_dim}")
-        print(f"LoRA rank     : {lora_rank}")
+        print(f"LoRA ranks    : slow={RANK_BY_BANDWIDTH['slow']}  "
+              f"medium={RANK_BY_BANDWIDTH['medium']}  "
+              f"fast={RANK_BY_BANDWIDTH['fast']} (max)")
         print(f"Learning rate : {lr}")
         print(f"Bandwidth     : "
-              f"{self.bandwidth_profiles.count('slow')} slow, "
-              f"{self.bandwidth_profiles.count('medium')} medium, "
-              f"{self.bandwidth_profiles.count('fast')} fast")
+              f"{rank_counts['slow']} slow (r={RANK_BY_BANDWIDTH['slow']}), "
+              f"{rank_counts['medium']} medium (r={RANK_BY_BANDWIDTH['medium']}), "
+              f"{rank_counts['fast']} fast (r={RANK_BY_BANDWIDTH['fast']})")
         print(f"Eval fraction : {eval_fraction:.0%}  ({n_eval} / {num_clients} users)")
         print(f"Eval every    : every {eval_every} epoch(s)")
         print(f"{'='*60}")
 
-    def _single_round(self, epoch: int, payload_size_bits: int) -> list:
+    def _single_round(self, epoch: int) -> list:
+        """PEFT round — each client uses its own rank-sized payload."""
         timings     = []
         agg_results = {"loss": [], "hit_ratio@10": [], "ndcg@10": []}
+        emb_dim     = 2 * self.latent_dim
 
         bar = tqdm(enumerate(self.clients), total=self.num_clients,
                    desc=f"Epoch {epoch}")
         for cid, client in bar:
-            bw         = BANDWIDTH_PROFILES[self.bandwidth_profiles[cid]]
-            dl_time    = calc_comm_time(payload_size_bits, bw["download"])
-            t0         = time.time()
-            results    = client.train(self.optimizers[cid])
-            train_time = time.time() - t0
-            ul_time    = calc_comm_time(payload_size_bits, bw["upload"])
+            bw      = BANDWIDTH_PROFILES[self.bandwidth_profiles[cid]]
+            r       = self.client_ranks[cid]
+            bits    = get_adaptive_lora_payload_bits(r, self.item_num, emb_dim)
+            dl_time = calc_comm_time(bits, bw["download"])
+            t0      = time.time()
+            results = client.train(self.optimizers[cid])
+            train_t = time.time() - t0
+            ul_time = calc_comm_time(bits, bw["upload"])
 
             timings.append({
                 "client_id":       cid,
                 "bandwidth":       self.bandwidth_profiles[cid],
-                "download_time_s": round(dl_time,    4),
-                "train_time_s":    round(train_time, 4),
-                "upload_time_s":   round(ul_time,    4),
-                "total_time_s":    round(dl_time + train_time + ul_time, 4),
+                "rank":            r,
+                "download_time_s": round(dl_time,  4),
+                "train_time_s":    round(train_t,  4),
+                "upload_time_s":   round(ul_time,  4),
+                "total_time_s":    round(dl_time + train_t + ul_time, 4),
             })
             for key in ["loss", "hit_ratio@10", "ndcg@10"]:
                 agg_results[key].append(results[key])
 
-            # Save LoRA update (lora_A, lora_B + shared layers)
-            update = client.ncf.get_lora_update()
-            torch.save(update, f"./models/local_items/lora_dp{cid}.pt")
+            torch.save(client.ncf.get_lora_update(),
+                       f"./models/local_items/lora_dp{cid}.pt")
             client.ncf.to(self.device)
-
-            bar.set_postfix({"loss":  f"{results['loss']:.4f}",
-                             "HR@10": f"{results['hit_ratio@10']:.4f}"})
+            bar.set_postfix({"loss": f"{results['loss']:.4f}",
+                             "rank": r})
         bar.close()
 
         self.metrics_log.append({
@@ -339,13 +393,14 @@ class FederatedNCF:
         Load aggregated E0 + MLP into every client, reset LoRA to zero-delta,
         then switch all clients to PEFT mode.
         """
-        print("\n[Transition] Warm-up → PEFT  "
-              "(freezing E0 & MLP, resetting LoRA adapters)\n")
+        print("\n[Transition] Warm-up → Adaptive PEFT  "
+              f"(ranks: slow={RANK_BY_BANDWIDTH['slow']}, "
+              f"medium={RANK_BY_BANDWIDTH['medium']}, "
+              f"fast={RANK_BY_BANDWIDTH['fast']})\n")
         for client in self.clients:
             client.ncf.load_server_weights(warmup_server_state)
             client.ncf.reset_lora()
             client.ncf.set_peft_mode()
-        # Reset optimizers to track only PEFT params
         self.optimizers = [
             torch.optim.Adam(
                 filter(lambda p: p.requires_grad, c.ncf.parameters()), lr=self.lr
@@ -355,137 +410,114 @@ class FederatedNCF:
     def train(self):
         item_num = self.item_num
         emb_dim  = 2 * self.latent_dim
+        max_rank = self.lora_rank
 
         server_model = ServerNeuralCollaborativeFiltering(
             item_num=item_num, predictive_factor=self.latent_dim,
-            lora_rank=self.lora_rank)
+            lora_rank=max_rank)
         torch.save(server_model.state_dict(), "./models/central/server0.pt")
 
-        shared_params = sum(
-            p.numel() for name, p in server_model.named_parameters()
-            if "lora" not in name and "E0" not in name
-        )
-        warmup_payload_bits = get_full_model_size_bits(item_num, emb_dim, shared_params)
-        peft_payload_bits   = get_lora_payload_size_bits(
-            self.lora_rank, item_num, emb_dim, shared_params)
-        full_size_bits      = get_full_model_size_bits(item_num, emb_dim, shared_params)
+        shared_params    = sum(p.numel() for n, p in server_model.named_parameters()
+                               if "lora" not in n and "E0" not in n)
+        full_size_bits   = get_full_model_size_bits(item_num, emb_dim, shared_params)
+        warmup_bits      = full_size_bits
+        avg_peft_bits    = int(np.mean([
+            get_adaptive_lora_payload_bits(r, item_num, emb_dim)
+            for r in self.client_ranks]))
 
         print(f"\n{'='*60}")
-        print(f"Two-phase LoRA FedAvg  [warmup={self.warmup_epochs} | rank={self.lora_rank}]")
-        print(f"  Warm-up payload : {warmup_payload_bits/8/1024:.2f} KB")
-        print(f"  PEFT payload    : {peft_payload_bits/8/1024:.2f} KB  "
-              f"({100*peft_payload_bits/full_size_bits:.1f}% of full)")
+        print(f"Adaptive LoRA FedAvg  [warmup={self.warmup_epochs} | "
+              f"max_rank={max_rank}]")
+        print(f"  Warm-up payload  : {warmup_bits/8/1024:.2f} KB")
+        print(f"  PEFT avg payload : {avg_peft_bits/8/1024:.2f} KB  "
+              f"({100*avg_peft_bits/full_size_bits:.1f}% of full)")
+        for bw, r in RANK_BY_BANDWIDTH.items():
+            bits = get_adaptive_lora_payload_bits(r, item_num, emb_dim)
+            print(f"    {bw:6s} rank={r}: {bits/8/1024:.2f} KB  "
+                  f"({100*bits/full_size_bits:.1f}%)")
         print(f"{'='*60}\n")
 
         # ── Phase 1: Warm-up ──────────────────────────────────────────────────
-        # Create warmup optimizers ONCE before loop — preserve Adam momentum
-        for cid, client in enumerate(self.clients):
-            client.ncf.to(self.device)
-            client.set_warmup_mode()
-        self.optimizers = [
-            torch.optim.Adam(
-                filter(lambda p: p.requires_grad, c.ncf.parameters()), lr=self.lr
-            ) for c in self.clients
-        ]
-
         for epoch in range(self.warmup_epochs):
             warmup_state = torch.load(f"./models/central/server{epoch}.pt")
-            warmup_state_no_lora = {k: v for k, v in warmup_state.items()
-                                    if "lora" not in k}
             for cid, client in enumerate(self.clients):
                 client.ncf.to(self.device)
-                client.ncf.load_server_weights(warmup_state_no_lora)
-                # ── do NOT call set_warmup_mode or recreate optimizer here ──
-
-            timings  = self._warmup_single_round(epoch, warmup_payload_bits)
+                client.ncf.load_server_weights(warmup_state)
+                client.set_warmup_mode()
+            self.optimizers = [
+                torch.optim.Adam(
+                    filter(lambda p: p.requires_grad, c.ncf.parameters()), lr=self.lr
+                ) for c in self.clients
+            ]
+            timings  = self._warmup_single_round(epoch, warmup_bits)
             agg_time = federate_warmup(self.utils)
-            self._print_timing(epoch, timings, agg_time,
-                               warmup_payload_bits, full_size_bits)
+            self._print_timing(epoch, timings, agg_time, warmup_bits, full_size_bits)
 
         # ── Transition ────────────────────────────────────────────────────────
         final_warmup_state = torch.load(
             f"./models/central/server{self.warmup_epochs}.pt")
 
-        # Evaluate once right after warm-up completes
-        print("\n[Eval after warm-up]")
-        self._evaluate(self.warmup_epochs - 1, k=10, n_neg=99)
-
-        peft_start_model = ServerNeuralCollaborativeFiltering(
-            item_num=item_num, predictive_factor=self.latent_dim,
-            lora_rank=self.lora_rank)
-        # Overlay warmup keys (E0 + MLP); LoRA keys stay at their init values
-        merged = peft_start_model.state_dict()
+        peft_start = ServerNeuralCollaborativeFiltering(
+            item_num=item_num, predictive_factor=self.latent_dim, lora_rank=max_rank)
+        merged = peft_start.state_dict()
         for k, v in final_warmup_state.items():
             if k in merged:
                 merged[k] = v
-        peft_start_model.load_state_dict(merged)
-        torch.save(peft_start_model.state_dict(),
+        peft_start.load_state_dict(merged)
+        torch.save(peft_start.state_dict(),
                    f"./models/central/server{self.warmup_epochs}.pt")
 
-        self._transition_to_peft(final_warmup_state)   # creates PEFT optimizers once
+        self._transition_to_peft(final_warmup_state)
 
-        # ── Phase 2: PEFT ─────────────────────────────────────────────────────
-        for epoch in range(self.warmup_epochs, self.warmup_epochs + self.aggregation_epochs):
+        # ── Phase 2: Adaptive PEFT ────────────────────────────────────────────
+        for epoch in range(self.warmup_epochs,
+                           self.warmup_epochs + self.aggregation_epochs):
+            # Download: slice server's max-rank adapters to each client's rank
             server_model = ServerNeuralCollaborativeFiltering(
                 item_num=item_num, predictive_factor=self.latent_dim,
-                lora_rank=self.lora_rank)
+                lora_rank=max_rank)
             server_model.load_state_dict(
                 torch.load(f"./models/central/server{epoch}.pt"))
             server_model.eval()
 
-            download_payload = server_model.get_download_payload()
             for cid, client in enumerate(self.clients):
+                r = self.client_ranks[cid]
                 client.ncf.to(self.device)
-                lora_payload = {k: v for k, v in download_payload.items() if "lora" in k}
-                client.ncf.load_server_weights(
-                    {k: v.to(self.device) for k, v in lora_payload.items()})
-                # ── do NOT recreate optimizer here — Adam momentum must persist ──
+                # Deliver only the first r rank-slices
+                lora_payload = server_model.get_download_payload_for_rank(r)
+                lora_only    = {k: v.to(self.device)
+                                for k, v in lora_payload.items() if "lora" in k}
+                client.ncf.load_server_weights(lora_only)
+                self.optimizers[cid] = torch.optim.Adam(
+                    filter(lambda p: p.requires_grad, client.ncf.parameters()),
+                    lr=self.lr)
 
-            timings  = self._single_round(epoch, peft_payload_bits)
-            agg_time = federate(self.utils)
-            self._print_timing(epoch, timings, agg_time,
-                               peft_payload_bits, full_size_bits)
+            timings  = self._single_round(epoch)
+            # Zero-pad aggregate: pass per-client ranks
+            agg_time = federate_adaptive(self.utils, self.client_ranks, max_rank)
+            self._print_timing(epoch, timings, agg_time, avg_peft_bits, full_size_bits)
             self.timing_log.append({"epoch": epoch, "timings": timings,
                                     "agg_time": agg_time})
 
             rel_epoch = epoch - self.warmup_epochs
-            total     = self.aggregation_epochs
-            if (rel_epoch + 1) % self.eval_every == 0 or rel_epoch == total - 1:
+            if (rel_epoch + 1) % self.eval_every == 0 or \
+               rel_epoch == self.aggregation_epochs - 1:
                 self._evaluate(epoch, k=10, n_neg=99)
 
         self._final_summary()
-        if self.save_log and self.logger:
-            self.logger.close()
+        self.logger.close()
 
     def _final_summary(self):
+        """Print and save final metrics summary."""
+        last_epoch = self.warmup_epochs + self.aggregation_epochs - 1
+        final_metrics = self.metrics_log[-1]
         print(f"\n{'='*60}")
-        print(f"TRAINING COMPLETE — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Final Metrics  [Epoch {last_epoch}]")
         print(f"{'='*60}")
-
-        if self.eval_log:
-            print(f"\n-- Standard leave-one-out evaluation --")
-            print(f"{'Epoch':>6} | {'HR@10':>8} | {'NDCG@10':>10} | "
-                  f"{'EvalLoss':>10} | {'Users':>7}")
-            print("-" * 52)
-            for e in self.eval_log:
-                print(f"{e['epoch']:>6} | {e['hr@10']:>8.4f} | "
-                      f"{e['ndcg@10']:>10.4f} | {e['eval_loss']:>10.4f} | "
-                      f"{e['evaluated_users']:>7}")
-            best_hr   = max(self.eval_log, key=lambda x: x["hr@10"])
-            best_ndcg = max(self.eval_log, key=lambda x: x["ndcg@10"])
-            last      = self.eval_log[-1]
-            print(f"\nBest  HR@10   : {best_hr['hr@10']:.6f}  (epoch {best_hr['epoch']})")
-            print(f"Best  NDCG@10 : {best_ndcg['ndcg@10']:.6f}  (epoch {best_ndcg['epoch']})")
-            print(f"Final HR@10   : {last['hr@10']:.6f}")
-            print(f"Final NDCG@10 : {last['ndcg@10']:.6f}")
-
-        if self.timing_log:
-            total_round = self.cumulative_time
-            print(f"\nTotal round time : {total_round:.2f}s  ({total_round/60:.2f} min)")
-            print(f"Avg time / round : {total_round/len(self.timing_log):.4f}s")
-            print(f"Total agg time   : {self.cumulative_agg_time:.2f}s")
-
-        print(f"\nLog saved → {self.log_path}" if self.save_log else "\n(log not saved)")
+        for key, value in final_metrics.items():
+            if key == "epoch":
+                continue
+            print(f"  {key:15s}: {value:.6f}")
         print(f"{'='*60}")
 
 
@@ -507,13 +539,12 @@ if __name__ == "__main__":
         local_epochs       = 2,
         batch_size         = 256,
         latent_dim         = 64,
-        lora_rank          = 8,
+        lora_rank          = 8,        # = max_rank, fast clients get this
         lr                 = 5e-4,
         seed               = 42,
         device             = DEVICE,
         eval_fraction      = 0.2,
         eval_every         = 5,
         warmup_epochs      = 5,
-        save_log           = False,   # ← set False to disable
     )
     fncf.train()
