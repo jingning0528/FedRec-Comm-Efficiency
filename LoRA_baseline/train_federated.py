@@ -160,9 +160,38 @@ class FederatedNCF:
         self.lora_rank          = lora_rank
         self.lr                 = lr
         self.item_num           = train_matrix.shape[1]
-        self.warmup_epochs      = warmup_epochs   # ← add this line
-        self.save_log = save_log
+        self.warmup_epochs      = warmup_epochs
+        self.save_log           = save_log
 
+        # ── These must come BEFORE the print block ────────────────────────────
+        self.bandwidth_profiles = assign_bandwidth(num_clients, seed=seed)
+        self.metrics_log  = []; self.eval_log = []; self.timing_log = []
+        self.utils        = Utils(num_clients)
+        self.eval_every   = eval_every
+
+        self.cumulative_time          = 0.0
+        self.cumulative_download_time = 0.0
+        self.cumulative_train_time    = 0.0
+        self.cumulative_upload_time   = 0.0
+        self.cumulative_agg_time      = 0.0
+
+        rng              = np.random.default_rng(seed)
+        n_eval           = max(1, int(num_clients * eval_fraction))
+        self.eval_client_ids = rng.choice(num_clients, size=n_eval, replace=False).tolist()
+
+        assert train_matrix.shape[0] == num_clients
+        self.clients = [
+            NCFTrainer(train_matrix[i:i+1], epochs=local_epochs,
+                       batch_size=batch_size, latent_dim=latent_dim,
+                       lora_rank=lora_rank, device=self.device,
+                       global_user_offset=i)
+            for i in range(num_clients)
+        ]
+        self.optimizers = [
+            torch.optim.Adam(c.ncf.parameters(), lr=lr)
+            for c in self.clients
+        ]
+        # ── Logging ───────────────────────────────────────────────────────────
         root      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         log_dir   = os.path.join(root, "result_figure")
         folder    = os.path.basename(os.path.dirname(os.path.abspath(__file__)))
@@ -176,6 +205,7 @@ class FederatedNCF:
             self.logger   = None
             self.log_path = None
 
+        # ── Print block (all attributes exist by here) ────────────────────────
         print(f"Log file : {self.log_path}")
         print(f"Started  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Device   : {self.device}")
